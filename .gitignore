@@ -1,0 +1,21 @@
+# Directories to exclude
+controller_rl_grid/
+local_kernels/
+logs/
+__pycache__/
+*.pyc
+
+# TRL source (separate repo)
+trl_source/
+
+# Checkpoints and outputs
+*.pt
+*.bin
+*.safetensors
+wandb/
+
+# Slurm outputs
+*.out
+*.err
+slurm-*.out
+

@@ -390,13 +390,20 @@ def mlp_forward(
             return routed_out, router_logits, controller_state
 
     router_logits_tokens = router_logits.view(batch_size, seq_len, -1)
+    # Keep per-token hidden states for controller (needed when input_type="hidden_states")
+    hidden_states_tokens = hidden_states.view(batch_size, seq_len, -1)
     allowed_mask = controller_state.allowed_mask if controller_state is not None else None
     hidden_state = controller_state.hidden_state if controller_state is not None else None
+    # For activation controller, track current_expert_indices
+    current_expert_indices = controller_state.current_expert_indices if (controller_state is not None and hasattr(controller_state, 'current_expert_indices')) else None
+    use_activation_controller = getattr(self, "controller_type", "rnn") == "activation"
+    
     switch_trace = []
     switch_logprob_trace = []
     selection_logprob_trace = []
     selected_indices_trace = []
     controller_input_trace = []
+    q_u_old_trace = []
 
     layer_idx = getattr(self, "layer_idx", None)
     record_actions = _runtime_get(controller_runtime, "record_actions", None)
@@ -500,25 +507,31 @@ def mlp_forward(
             allowed_mask = torch.zeros_like(raw_token_logits, dtype=torch.bool)
             top_allowed = torch.topk(raw_token_logits, self.controller_allowed_experts, dim=-1).indices
             allowed_mask.scatter_(1, top_allowed, True)
-            hidden_state = self.controller.init_hidden(raw_token_logits.shape[0], raw_token_logits.device, raw_token_logits.dtype)
             switch_decision = torch.zeros(raw_token_logits.shape[0], dtype=torch.bool, device=raw_token_logits.device)
             # Use float32 for log probabilities (controller outputs are float32 for numerical stability)
             switch_logprob = torch.zeros(raw_token_logits.shape[0], dtype=torch.float32, device=raw_token_logits.device)
             selection_logprob = torch.zeros(raw_token_logits.shape[0], dtype=torch.float32, device=raw_token_logits.device)
-            selected_indices = torch.full(
-                (raw_token_logits.shape[0], self.controller_allowed_experts),
-                -1,
-                dtype=torch.long,
-                device=raw_token_logits.device,
-            )
+            selected_indices = top_allowed  # Use actual top-k indices
             value = torch.zeros(raw_token_logits.shape[0], dtype=torch.float32, device=raw_token_logits.device)
-            # Controller input for recording: x_t = [router_softmax, expert_mask]
+            q_u_old = torch.zeros(raw_token_logits.shape[0], dtype=torch.float32, device=raw_token_logits.device)
             controller_input = torch.cat([router_softmax, allowed_mask.to(dtype=raw_token_logits.dtype)], dim=-1)
             
-            # Run controller to initialize hidden state for t=1
-            # This ensures t=0's hidden state captures the initial context
-            x_t = controller_input
-            hidden_state, _, _, _ = self.controller(x_t, hidden_state)
+            if use_activation_controller:
+                # Activation controller: initialize current_expert_indices with router top-k
+                current_expert_indices = top_allowed
+            else:
+                # RNN controller: initialize hidden state and run forward
+                hidden_state = self.controller.init_hidden(raw_token_logits.shape[0], raw_token_logits.device, raw_token_logits.dtype)
+                # Controller input for recording: depends on input_type
+                if self.controller.input_type == "hidden_states":
+                    token_hidden = hidden_states_tokens[:, token_idx, :]
+                    controller_input = torch.cat([token_hidden, allowed_mask.to(dtype=token_hidden.dtype)], dim=-1)
+                else:
+                    controller_input = torch.cat([router_softmax, allowed_mask.to(dtype=raw_token_logits.dtype)], dim=-1)
+                
+                # Run controller to initialize hidden state for t=1
+                x_t = controller_input.to(dtype=self.controller.gru_cell.weight_ih.dtype)
+                hidden_state, _, _, _ = self.controller(x_t, hidden_state)
         else:
             # t>0: Normal controller operation (both prefill and generation)
             # Controller can decide to switch experts based on learned policy
@@ -533,32 +546,66 @@ def mlp_forward(
                     replay_payload["switch_logprobs"] = layer_replay["switch_logprobs"][:, token_idx]
                 if "selection_logprobs" in layer_replay:
                     replay_payload["selection_logprobs"] = layer_replay["selection_logprobs"][:, token_idx]
-            (
-                switch_decision,
-                allowed_mask,
-                hidden_state,  # Now returns hidden state instead of prev_controller_logits
-                switch_logprob,
-                selection_logprob,
-                selected_indices,
-                value,
-                controller_input,  # Now returns x_t = [router_softmax, expert_mask]
-            ) = self._apply_controller_step(
-                router_softmax,  # Pass softmax instead of raw logits
-                allowed_mask,
-                hidden_state,  # Pass hidden state instead of prev_controller_logits
-                controller_runtime,
-                replay_payload=replay_payload,
-            )
+            
+            if use_activation_controller:
+                # Activation controller: use LLM hidden states + current expert indices
+                token_hidden = hidden_states_tokens[:, token_idx, :]
+                (
+                    switch_decision,
+                    current_expert_indices,  # updated if switch=1
+                    switch_logprob,
+                    selection_logprob,
+                    selected_indices,
+                    value,
+                    q_u_old,
+                ) = self._apply_activation_controller_step(
+                    raw_token_logits,    # Raw router logits for residual connection
+                    current_expert_indices,  # Current option (expert set)
+                    token_hidden,    # LLM hidden states
+                    controller_runtime,
+                    replay_payload=replay_payload,
+                )
+                # Update allowed_mask based on current_expert_indices
+                allowed_mask = torch.zeros_like(raw_token_logits, dtype=torch.bool)
+                allowed_mask.scatter_(1, current_expert_indices, True)
+                controller_input = torch.cat([router_softmax, allowed_mask.to(dtype=raw_token_logits.dtype)], dim=-1)
+            else:
+                # RNN controller
+                (
+                    switch_decision,
+                    allowed_mask,
+                    hidden_state,
+                    switch_logprob,
+                    selection_logprob,
+                    selected_indices,
+                    value,
+                    controller_input,
+                ) = self._apply_controller_step(
+                    router_softmax,
+                    raw_token_logits,
+                    allowed_mask,
+                    hidden_state,
+                    controller_runtime,
+                    replay_payload=replay_payload,
+                    mlp_hidden_states=hidden_states_tokens[:, token_idx, :],
+                )
+                q_u_old = torch.zeros(raw_token_logits.shape[0], dtype=torch.float32, device=raw_token_logits.device)
 
-        masked_logits = raw_token_logits.masked_fill(~allowed_mask, mask_value)
-        router_logits_tokens[:, token_idx, :] = masked_logits
+        # Record traces BEFORE masking (use .clone() since detach() shares storage)
+        # CRITICAL: raw_token_logits is a view into router_logits_tokens, so we must clone
+        # before the in-place masking overwrites the storage
+        router_logits_trace.append(raw_token_logits.detach().clone())
         switch_trace.append(switch_decision)
         switch_logprob_trace.append(switch_logprob)
         selection_logprob_trace.append(selection_logprob)
         selected_indices_trace.append(selected_indices)
-        controller_input_trace.append(controller_input.detach())
+        controller_input_trace.append(controller_input.detach().clone())
         value_trace.append(value)
-        router_logits_trace.append(raw_token_logits.detach())
+        q_u_old_trace.append(q_u_old)
+        
+        # Apply mask to router logits (this overwrites router_logits_tokens storage)
+        masked_logits = raw_token_logits.masked_fill(~allowed_mask, mask_value)
+        router_logits_tokens[:, token_idx, :] = masked_logits
 
     masked_router_logits = router_logits_tokens.reshape(batch_size * seq_len, -1)
     with on_device(masked_router_logits.device):
@@ -566,10 +613,18 @@ def mlp_forward(
     routed_out = _dispatch_experts(hidden_states, routing_data, gather_idx, scatter_idx)
     routed_out = routed_out.reshape(batch_size, seq_len, self.router.hidden_dim)
 
-    next_state = GptOssControllerLayerState(
-        allowed_mask=allowed_mask,
-        hidden_state=hidden_state,  # Canonical RNN: pass hidden state
-    )
+    # Build next state based on controller type
+    if use_activation_controller:
+        next_state = GptOssControllerLayerState(
+            allowed_mask=allowed_mask,
+            hidden_state=None,
+            current_expert_indices=current_expert_indices,
+        )
+    else:
+        next_state = GptOssControllerLayerState(
+            allowed_mask=allowed_mask,
+            hidden_state=hidden_state,
+        )
 
     if record_actions is not None and layer_idx is not None:
         new_record = {
@@ -578,8 +633,11 @@ def mlp_forward(
             "selection_logprobs": torch.stack(selection_logprob_trace, dim=1),
             "selected_indices": torch.stack(selected_indices_trace, dim=1),
             "values": torch.stack(value_trace, dim=1),
+            "q_u_old_values": torch.stack(q_u_old_trace, dim=1),  # For activation controller
             "router_logits": torch.stack(router_logits_trace, dim=1),
-            "controller_inputs": torch.stack(controller_input_trace, dim=1),  # x_t = [router_softmax, expert_mask]
+            "controller_inputs": torch.stack(controller_input_trace, dim=1),
+            # Use hidden_states_tokens (shape [batch, seq, hidden]) not hidden_states (flattened)
+            "llm_hidden_states": hidden_states_tokens.detach().clone(),
         }
         if layer_idx in record_actions:
             prev_record = record_actions[layer_idx]

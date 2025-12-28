@@ -92,45 +92,56 @@ def _safe_log1m(probs: torch.Tensor) -> torch.Tensor:
 
 
 def _plackett_luce_sample(
-    logits: torch.Tensor, k: int, generator: Optional[torch.Generator] = None
+    logits: torch.Tensor, k: int, generator: Optional[torch.Generator] = None,
+    compute_logprob: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample k items from a Plackett-Luce distribution parameterized by logits.
+    Returns (selected_indices, log_probability).
+    
+    Uses Gumbel-softmax trick for O(1) vectorized sampling instead of O(k) loop.
+    Mathematically equivalent: Plackett-Luce sampling = add Gumbel noise + take top-k
+    
+    Args:
+        logits: [batch, n] logits over n items
+        k: number of items to sample
+        generator: optional random generator
+        compute_logprob: if False, return zeros for logprob (much faster for inference).
+                        Set True only when you need the log probability for training.
+    """
     if k <= 0:
         raise ValueError("`k` must be positive for Plackett-Luce sampling.")
     batch_size, num_candidates = logits.shape
     
-    # Clamp logits to prevent numerical issues (avoid Inf after exp)
-    # Using ±50 as reasonable bounds for logits before softmax
-    remaining = logits.clamp(min=-50.0, max=50.0).clone()
+    # Clamp logits for numerical stability
+    clamped_logits = logits.clamp(min=-50.0, max=50.0)
     
-    selected: list[torch.Tensor] = []
-    total_logprob = torch.zeros(batch_size, device=logits.device, dtype=logits.dtype)
-    eps = torch.finfo(logits.dtype).tiny
+    # Gumbel-softmax trick: sample Gumbel noise and add to logits
+    # Gumbel(0, 1) = -log(-log(U)) where U ~ Uniform(0, 1)
+    if generator is None:
+        u = torch.rand_like(clamped_logits)
+    else:
+        u = torch.rand(clamped_logits.shape, device=clamped_logits.device, 
+                       dtype=clamped_logits.dtype, generator=generator)
     
-    for _ in range(k):
-        probs = torch.nn.functional.softmax(remaining, dim=-1)
-        
-        # Safety check: replace NaN/Inf with uniform distribution
-        bad_probs = ~torch.isfinite(probs).all(dim=-1)
-        if bad_probs.any():
-            # Count valid (non -inf) positions
-            valid_mask = remaining > float("-inf")
-            num_valid = valid_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            uniform = valid_mask.float() / num_valid
-            probs = torch.where(bad_probs.unsqueeze(-1), uniform, probs)
-        
-        # Ensure probabilities are valid (non-negative, sum to 1)
-        probs = probs.clamp(min=eps)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        
-        if generator is None:
-            idx = torch.multinomial(probs, num_samples=1, replacement=False)
-        else:
-            idx = torch.multinomial(probs, num_samples=1, replacement=False, generator=generator)
-        gathered = torch.gather(probs, 1, idx).clamp(min=eps)
-        total_logprob += gathered.log().squeeze(-1)
-        remaining.scatter_(1, idx, float("-inf"))
-        selected.append(idx.squeeze(-1))
-    return torch.stack(selected, dim=-1), total_logprob
+    # Clamp u to avoid log(0) or log(1)
+    u = u.clamp(min=1e-10, max=1 - 1e-10)
+    gumbel_noise = -torch.log(-torch.log(u))
+    
+    # Perturbed logits - taking top-k gives Plackett-Luce sample
+    perturbed = clamped_logits + gumbel_noise
+    
+    # Take top-k indices - this IS the Plackett-Luce sample!
+    _, selected_indices = torch.topk(perturbed, k, dim=-1)
+    
+    if compute_logprob:
+        # Only compute logprob when needed (training phase)
+        total_logprob = _plackett_luce_logprob(clamped_logits, selected_indices)
+    else:
+        # Return zeros during inference for speed (logprob not needed)
+        total_logprob = torch.zeros(batch_size, device=logits.device, dtype=logits.dtype)
+    
+    return selected_indices, total_logprob
 
 
 def _plackett_luce_logprob(
@@ -150,16 +161,20 @@ def _plackett_luce_logprob(
         active = step_indices >= 0
         if not torch.any(active):
             continue
-        current_remaining = remaining[active]
+        # Get integer indices for active rows (boolean indexing creates a copy, not view)
+        active_rows = torch.where(active)[0]
+        current_remaining = remaining[active_rows]
         log_probs = torch.nn.functional.log_softmax(current_remaining, dim=-1)
         # Handle potential NaN in log_probs (replace with uniform log prob as fallback)
         if not torch.isfinite(log_probs).all():
             num_valid = (current_remaining > float("-inf")).sum(dim=-1, keepdim=True).clamp(min=1)
             uniform_log_prob = -torch.log(num_valid.float())
             log_probs = torch.where(torch.isfinite(log_probs), log_probs, uniform_log_prob)
-        gathered = torch.gather(log_probs, 1, step_indices[active].unsqueeze(-1))
-        total_logprob[active] += gathered.squeeze(-1)
-        remaining[active].scatter_(1, step_indices[active].unsqueeze(-1), float("-inf"))
+        gathered = torch.gather(log_probs, 1, step_indices[active_rows].unsqueeze(-1))
+        total_logprob[active_rows] += gathered.squeeze(-1)
+        # Use integer indexing to actually modify remaining in-place
+        # (boolean indexing like remaining[active] creates a copy, so scatter_ wouldn't work)
+        remaining[active_rows, step_indices[active_rows]] = float("-inf")
     return total_logprob
 
 
@@ -172,7 +187,8 @@ def _indices_to_mask(indices: torch.Tensor, num_cols: int) -> torch.Tensor:
 @dataclass
 class GptOssControllerLayerState:
     allowed_mask: torch.Tensor
-    hidden_state: torch.Tensor  # Canonical RNN hidden state (not output logits)
+    hidden_state: Optional[torch.Tensor] = None  # RNN hidden state (for RNN controller)
+    current_expert_indices: Optional[torch.Tensor] = None  # Current option/expert set (for activation controller)
 
 
 class GptOssRMSNorm(nn.Module):
@@ -293,15 +309,136 @@ class GptOssTopKRouter(nn.Module):
         return router_scores, router_indices
 
 
+class LayerNormGRUCell(nn.Module):
+    """
+    Layer-Normalized GRU Cell with separate normalization for input and hidden.
+    
+    Applies LayerNorm SEPARATELY to input and hidden contributions before combining.
+    This preserves the relative importance of new input vs. recurrent state,
+    preventing mode collapse where hidden state overwhelms input signal.
+    
+    Standard GRU:
+        r = σ(W_ir @ x + W_hr @ h + b_r)
+        z = σ(W_iz @ x + W_hz @ h + b_z)
+        n = tanh(W_in @ x + r * (W_hn @ h) + b_n)
+        h_new = (1 - z) * n + z * h
+        
+    Layer-Normalized GRU (this implementation - separate LN):
+        r = σ(LN_ri(W_ir @ x) + LN_rh(W_hr @ h))
+        z = σ(LN_zi(W_iz @ x) + LN_zh(W_hz @ h))
+        n = tanh(LN_ni(W_in @ x) + r * LN_nh(W_hn @ h))
+        h_new = (1 - z) * n + z * h
+        
+    Each LN uses elementwise_affine=True (default), providing scale and bias.
+    Separate normalization ensures input and hidden signals maintain balanced
+    contributions regardless of their raw magnitudes.
+    
+    When use_layer_norm=False, we use simple biases instead of LN.
+    """
+    def __init__(self, input_size: int, hidden_size: int, use_layer_norm: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.use_layer_norm = use_layer_norm
+        
+        # Input-to-hidden weights for all gates [r, z, n]
+        self.weight_ih = nn.Parameter(torch.empty(3 * hidden_size, input_size))
+        # Hidden-to-hidden weights for all gates [r, z, n]
+        self.weight_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+        
+        # Separate LayerNorm for input and hidden contributions (eps=1e-4 for RL stability)
+        # This preserves relative input vs hidden importance
+        if use_layer_norm:
+            # Input path LayerNorms (one per gate)
+            self.ln_ri = nn.LayerNorm(hidden_size, eps=1e-4)  # reset gate, input
+            self.ln_zi = nn.LayerNorm(hidden_size, eps=1e-4)  # update gate, input
+            self.ln_ni = nn.LayerNorm(hidden_size, eps=1e-4)  # candidate, input
+            # Hidden path LayerNorms (one per gate)
+            self.ln_rh = nn.LayerNorm(hidden_size, eps=1e-4)  # reset gate, hidden
+            self.ln_zh = nn.LayerNorm(hidden_size, eps=1e-4)  # update gate, hidden
+            self.ln_nh = nn.LayerNorm(hidden_size, eps=1e-4)  # candidate, hidden
+            # No separate bias needed - LN.bias serves this purpose
+            self.bias_r = None
+            self.bias_z = None
+            self.bias_n = None
+        else:
+            self.ln_ri = None
+            self.ln_zi = None
+            self.ln_ni = None
+            self.ln_rh = None
+            self.ln_zh = None
+            self.ln_nh = None
+            # When LN is disabled, use explicit biases (like standard GRU)
+            self.bias_r = nn.Parameter(torch.zeros(hidden_size))
+            self.bias_z = nn.Parameter(torch.zeros(hidden_size))
+            self.bias_n = nn.Parameter(torch.zeros(hidden_size))
+        
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        """Initialize parameters similar to nn.GRUCell."""
+        import math
+        stdv = 1.0 / math.sqrt(self.hidden_size)
+        for weight in [self.weight_ih, self.weight_hh]:
+            nn.init.uniform_(weight, -stdv, stdv)
+    
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of Layer-Normalized GRU cell.
+        
+        Args:
+            x: input tensor, shape (batch, input_size)
+            h: hidden state, shape (batch, hidden_size)
+            
+        Returns:
+            h_new: new hidden state, shape (batch, hidden_size)
+        """
+        # Compute input contributions: W_ih @ x -> [r, z, n] parts
+        gi = torch.mm(x, self.weight_ih.t())  # [batch, 3*hidden]
+        # Compute hidden contributions: W_hh @ h -> [r, z, n] parts
+        gh = torch.mm(h, self.weight_hh.t())  # [batch, 3*hidden]
+        
+        # Split into gates
+        gi_r, gi_z, gi_n = gi.chunk(3, dim=1)
+        gh_r, gh_z, gh_n = gh.chunk(3, dim=1)
+        
+        # Reset gate: r = σ(LN_ri(W_ir @ x) + LN_rh(W_hr @ h))
+        if self.ln_ri is not None:
+            r = torch.sigmoid(self.ln_ri(gi_r) + self.ln_rh(gh_r))
+        else:
+            r = torch.sigmoid(gi_r + gh_r + self.bias_r)
+        
+        # Update gate: z = σ(LN_zi(W_iz @ x) + LN_zh(W_hz @ h))
+        if self.ln_zi is not None:
+            z = torch.sigmoid(self.ln_zi(gi_z) + self.ln_zh(gh_z))
+        else:
+            z = torch.sigmoid(gi_z + gh_z + self.bias_z)
+        
+        # Candidate: n = tanh(LN_ni(W_in @ x) + r * LN_nh(W_hn @ h))
+        if self.ln_ni is not None:
+            n = torch.tanh(self.ln_ni(gi_n) + r * self.ln_nh(gh_n))
+        else:
+            n = torch.tanh(gi_n + r * gh_n + self.bias_n)
+        
+        # New hidden state: h_new = (1 - z) * n + z * h
+        h_new = (1 - z) * n + z * h
+        
+        return h_new
+
+
 class GptOssController(nn.Module):
     """
-    Canonical RNN Controller with separate hidden state.
+    Canonical RNN Controller with Layer-Normalized GRU (Ba et al., 2016).
     
     Architecture:
-        h_t = GRU(h_{t-1}, x_t)  where x_t = [router_softmax, expert_mask]
+        h_t = LayerNormGRU(h_{t-1}, x_t)  where x_t = [router_softmax, expert_mask]
         switch_logits = switch_head(h_t)
-        candidate_logits = expert_head(h_t)
+        candidate_logits = expert_head(h_t)  (perturbation for residual)
         value = value_head(h_t)
+        
+    The LayerNorm is applied INSIDE the GRU gates (to pre-activations),
+    which prevents the hidden state from growing unbounded while maintaining
+    stable gradients during backpropagation.
     
     The hidden state h carries temporal information across tokens,
     enabling the controller to make informed decisions based on history.
@@ -312,23 +449,72 @@ class GptOssController(nn.Module):
         super().__init__()
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.controller_hidden_dim
-        self.dropout = config.controller_dropout
+        self.use_layer_norm = getattr(config, "controller_layer_norm", True)  # Default: ON
+        self.input_type = getattr(config, "controller_input_type", "router_softmax")
+        self.model_hidden_size = config.hidden_size  # For hidden_states input type
         
-        # Input: [router_softmax, expert_mask] = 2 * num_experts
-        self.input_dim = 2 * self.num_experts
+        # Input dimension depends on input_type:
+        # - "router_softmax": [router_softmax, expert_mask] = 2 * num_experts
+        # - "hidden_states": [hidden_states, expert_mask] = hidden_size + num_experts
+        if self.input_type == "hidden_states":
+            self.input_dim = self.model_hidden_size + self.num_experts
+        else:
+            self.input_dim = 2 * self.num_experts
         
-        # GRU cell for RNN transition (single recurrent layer)
-        # Replaces the two separate 2-layer MLPs with a canonical RNN structure
-        self.gru_cell = nn.GRUCell(self.input_dim, self.hidden_dim)
+        # Layer-Normalized GRU cell (Ba et al., 2016)
+        # LayerNorm is applied to pre-activations inside the GRU gates
+        self.gru_cell = LayerNormGRUCell(
+            self.input_dim, 
+            self.hidden_dim, 
+            use_layer_norm=self.use_layer_norm
+        )
         
         # Output heads (all from hidden state h)
-        # These are simple linear projections from the rich hidden representation
         self.switch_head = nn.Linear(self.hidden_dim, 1)
         self.expert_head = nn.Linear(self.hidden_dim, self.num_experts)
         self.value_head = nn.Linear(self.hidden_dim, 1)
         
-        # Optional dropout on hidden state
-        self.hidden_dropout = nn.Dropout(self.dropout) if self.dropout else None
+        # Initialize value_head with small weights so V ≈ 0 initially
+        # This ensures termination advantage (Q - V + η) ≈ η from the start
+        with torch.no_grad():
+            self.value_head.weight.mul_(0.01)
+            self.value_head.bias.zero_()
+        
+        # Q_U head for Option-Critic (Harb et al., 2017)
+        # Q_U(s, o): value of executing option o in state s until termination
+        # Uses DeepSets encoder for the expert set (permutation-invariant)
+        self.expert_set_embed_dim = getattr(config, "controller_expert_embed_dim", 128)
+        self.expert_embedding = nn.Embedding(self.num_experts, self.expert_set_embed_dim)
+        
+        # DeepSets φ: per-element transformation
+        self.deepsets_phi = nn.Sequential(
+            nn.Linear(self.expert_set_embed_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        
+        # DeepSets ρ: post-pooling transformation (optional, can be identity)
+        # We'll just use the pooled output directly
+        
+        # Q-value head: outputs Q_U(s, o) directly (NOT dueling-style)
+        # Separate Q and V networks avoid split ambiguity and match Option-Critic theory.
+        # MLP with one hidden layer to capture non-linear interactions between
+        # hidden state and expert set representation
+        q_input_dim = self.hidden_dim + self.hidden_dim
+        q_hidden_dim = self.hidden_dim  # Same as controller hidden dim
+        self.q_head = nn.Sequential(
+            nn.Linear(q_input_dim, q_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(q_hidden_dim, 1)
+        )
+        # Initialize Q head: hidden layer normal, output layer small (0.01)
+        # This ensures Q ≈ 0 initially, matching V ≈ 0
+        # So termination advantage (Q - V + η) ≈ η and selection advantage ≈ 0 from start
+        with torch.no_grad():
+            # Hidden layer (index 0): keep default Xavier init
+            # Output layer (index 2): small init so Q ≈ 0
+            self.q_head[2].weight.mul_(0.01)
+            self.q_head[2].bias.zero_()
         
         # NOTE: dtype is set by from_pretrained() after __init__, so we cannot set it here.
         # Controller parameters are converted to float32 in controller_trainer.py after model loading.
@@ -352,18 +538,16 @@ class GptOssController(nn.Module):
             value: shape (batch,)
         """
         # Cast inputs to parameter dtype (handles bfloat16 input with float32 params)
-        param_dtype = next(self.gru_cell.parameters()).dtype
+        param_dtype = self.gru_cell.weight_ih.dtype
         x_t = x_t.to(dtype=param_dtype)
         h_prev = h_prev.to(dtype=param_dtype)
         
-        # GRU transition: h_t = GRU(h_{t-1}, x_t)
+        # Layer-Normalized GRU transition: h_t = LN_GRU(x_t, h_{t-1})
+        # LayerNorm is applied INSIDE the GRU gates (Ba et al., 2016)
         h_t = self.gru_cell(x_t, h_prev)
         
-        # Optional dropout on hidden state
-        if self.hidden_dropout is not None and self.training:
-            h_t = self.hidden_dropout(h_t)
-        
-        # Output heads (all from the same hidden state)
+        # Output heads use the hidden state directly
+        # (no need for external LayerNorm - it's already inside the GRU)
         switch_logits = self.switch_head(h_t).squeeze(-1)
         candidate_logits = self.expert_head(h_t)
         value = self.value_head(h_t).squeeze(-1)
@@ -373,6 +557,265 @@ class GptOssController(nn.Module):
     def init_hidden(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Initialize hidden state to zeros."""
         return torch.zeros(batch_size, self.hidden_dim, device=device, dtype=dtype)
+    
+    def compute_q_option(
+        self, 
+        h_t: torch.Tensor, 
+        expert_mask: torch.Tensor,
+        value: torch.Tensor,
+        selected_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Q_U(s, o): value of executing option o in state s.
+        
+        Uses a separate Q network (NOT dueling-style).
+        Q_U is computed directly from hidden state and expert set representation via DeepSets.
+        
+        This is used by Option-Critic (Harb et al., 2017) for:
+        - Termination advantage: adv_term = Q_U - V + η
+        - Selection advantage: A_select = Q_U - V
+        
+        Separate Q and V networks avoid split ambiguity and match the original Option-Critic formulation.
+        
+        Args:
+            h_t: hidden state from GRU, shape (batch, hidden_dim)
+            expert_mask: current option (binary mask), shape (batch, num_experts) - used if selected_indices not provided
+            value: V(s) from value_head, shape (batch,) - IGNORED (kept for API compatibility)
+            selected_indices: indices of selected experts, shape (batch, k) - preferred input
+            
+        Returns:
+            q_u: Q_U(s, o), shape (batch,)
+        """
+        # Cast to parameter dtype (access first Linear layer in the Sequential)
+        param_dtype = self.q_head[0].weight.dtype
+        h_t = h_t.to(dtype=param_dtype)
+        # Note: 'value' parameter is ignored - we use separate Q network, not Q = V + A
+        
+        # Get selected expert indices
+        if selected_indices is None:
+            # Convert mask to indices (fallback for backward compatibility)
+            # expert_mask is [batch, num_experts] with 1s for selected experts
+            selected_indices = expert_mask.to(dtype=param_dtype).nonzero(as_tuple=False)
+            # This is tricky for batched case - use topk on the mask as approximation
+            k = int(expert_mask.sum(dim=-1).max().item())
+            if k == 0:
+                k = 1  # Avoid empty selection
+            _, selected_indices = expert_mask.topk(k, dim=-1)
+        
+        # ROBUST HANDLING: Handle -1 sentinel values (e.g., from t=0 initialization)
+        # Clamp to valid range [0, num_experts-1] to avoid embedding crash
+        # Then mask out invalid positions so they don't contribute to the set representation
+        valid_mask = selected_indices >= 0  # [batch, k]
+        safe_indices = selected_indices.clamp(min=0, max=self.num_experts - 1)
+        
+        # DeepSets encoding: φ(embed) → mean → ρ
+        # selected_indices: [batch, k]
+        expert_embeds = self.expert_embedding(safe_indices)  # [batch, k, embed_dim]
+        expert_embeds = expert_embeds.to(dtype=param_dtype)
+        
+        # Zero out embeddings for invalid indices (where original was -1)
+        expert_embeds = expert_embeds * valid_mask.unsqueeze(-1).to(dtype=param_dtype)
+        
+        # Apply φ (per-element transformation)
+        transformed = self.deepsets_phi(expert_embeds)  # [batch, k, hidden_dim]
+        
+        # Permutation-invariant pooling (mean instead of sum for scale invariance)
+        # Count only valid positions to compute proper mean
+        num_valid = valid_mask.sum(dim=1, keepdim=True).clamp(min=1).to(dtype=param_dtype)  # [batch, 1]
+        set_repr = transformed.sum(dim=1) / num_valid  # [batch, hidden_dim]
+        
+        # Concatenate hidden state and set representation for Q computation
+        q_input = torch.cat([h_t, set_repr], dim=-1)  # [batch, 2*hidden_dim]
+        q_u = self.q_head(q_input).squeeze(-1)  # Q_U(s, o)
+        
+        return q_u
+
+
+class GptOssActivationController(nn.Module):
+    """
+    Activation-based Controller that uses LLM hidden states directly (no RNN).
+    
+    Instead of learning an RNN hidden state, this controller takes the LLM's
+    hidden states as input (same as the router), making it more directly connected
+    to the LLM's representations.
+    
+    Architecture:
+        - Termination head: MLP(concat(h, s)) → switch_logit
+        - Selection head: Linear(h) → expert_logits (initialized from router)
+        - V head: Linear(h) → value
+        - Q head: MLP(concat(h, s)) → Q_U(s, option)
+        
+    Where h = LLM hidden state, s = DeepSets embedding of current expert set.
+    """
+    def __init__(self, config: GptOssConfig, router_weight: torch.Tensor = None, router_bias: torch.Tensor = None):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size  # LLM hidden dimension
+        
+        # Set embedding dimension (for DeepSets)
+        self.expert_set_embed_dim = getattr(config, "controller_expert_embed_dim", 128)
+        
+        # MLP hidden dimension for termination and Q heads
+        self.mlp_hidden_dim = getattr(config, "activation_controller_mlp_hidden", min(self.hidden_size // 4, 512))
+        
+        # DeepSets for expert set embedding
+        self.expert_embedding = nn.Embedding(self.num_experts, self.expert_set_embed_dim)
+        self.deepsets_phi = nn.Sequential(
+            nn.Linear(self.expert_set_embed_dim, self.mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.mlp_hidden_dim, self.mlp_hidden_dim),
+        )
+        
+        # Termination head: MLP(concat(h, s)) → switch_logit
+        # Input: concat(LLM hidden, expert set embedding)
+        term_input_dim = self.hidden_size + self.mlp_hidden_dim
+        self.termination_head = nn.Sequential(
+            nn.Linear(term_input_dim, self.mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_dim, 1)
+        )
+        # Initialize to low switch probability:
+        # 1. Set last layer weights to near-zero so output ≈ bias initially
+        # 2. Set bias to switch_init_bias (sigmoid(-3) ≈ 0.05)
+        switch_init_bias = getattr(config, "switch_init_bias", -3.0)
+        with torch.no_grad():
+            self.termination_head[2].weight.mul_(0.01)  # Small weights so output ≈ bias
+            self.termination_head[2].bias.fill_(switch_init_bias)
+        
+        # Selection head: Linear(h) → expert_logits
+        # Same architecture as router, initialize with router weights if provided
+        self.selection_head = nn.Linear(self.hidden_size, self.num_experts)
+        if router_weight is not None:
+            with torch.no_grad():
+                self.selection_head.weight.copy_(router_weight)
+        if router_bias is not None:
+            with torch.no_grad():
+                self.selection_head.bias.copy_(router_bias)
+        
+        # V head: Linear(h) → value
+        self.value_head = nn.Linear(self.hidden_size, 1)
+        # Initialize small so V ≈ 0 initially
+        with torch.no_grad():
+            self.value_head.weight.mul_(0.01)
+            self.value_head.bias.zero_()
+        
+        # Q head: MLP(concat(h, s)) → Q_U(s, option)
+        q_input_dim = self.hidden_size + self.mlp_hidden_dim
+        self.q_head = nn.Sequential(
+            nn.Linear(q_input_dim, self.mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_dim, 1)
+        )
+        # Initialize small so Q ≈ 0 initially
+        with torch.no_grad():
+            self.q_head[2].weight.mul_(0.01)
+            self.q_head[2].bias.zero_()
+    
+    def _compute_set_embedding(self, selected_indices: torch.Tensor, target_dtype: torch.dtype = None) -> torch.Tensor:
+        """
+        Compute DeepSets embedding for an expert set.
+        
+        Args:
+            selected_indices: [batch, k] indices of selected experts
+            target_dtype: Target dtype for the embedding (to match model dtype)
+            
+        Returns:
+            set_repr: [batch, mlp_hidden_dim] set embedding
+        """
+        # Determine target dtype from deepsets_phi weights if not specified
+        if target_dtype is None:
+            target_dtype = self.deepsets_phi[0].weight.dtype
+        
+        # Handle -1 sentinel values
+        valid_mask = selected_indices >= 0  # [batch, k]
+        safe_indices = selected_indices.clamp(min=0, max=self.num_experts - 1)
+        
+        # Get expert embeddings and cast to target dtype
+        expert_embeds = self.expert_embedding(safe_indices)  # [batch, k, embed_dim]
+        expert_embeds = expert_embeds.to(dtype=target_dtype)
+        
+        # Zero out invalid positions
+        expert_embeds = expert_embeds * valid_mask.unsqueeze(-1).to(dtype=target_dtype)
+        
+        # Apply φ (per-element transformation)
+        transformed = self.deepsets_phi(expert_embeds)  # [batch, k, mlp_hidden_dim]
+        
+        # Mean pooling (only over valid positions)
+        num_valid = valid_mask.sum(dim=1, keepdim=True).clamp(min=1).to(dtype=target_dtype)  # [batch, 1]
+        set_repr = transformed.sum(dim=1) / num_valid  # [batch, mlp_hidden_dim]
+        
+        return set_repr
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # LLM hidden states [batch, hidden_size]
+        current_expert_indices: torch.Tensor,  # Current option [batch, k]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for activation-based controller.
+        
+        Args:
+            hidden_states: LLM hidden states, shape (batch, hidden_size)
+            current_expert_indices: Indices of current expert set, shape (batch, k)
+            
+        Returns:
+            switch_logits: Termination logits, shape (batch,)
+            candidate_logits: Expert selection logits, shape (batch, num_experts)
+            value: V(s), shape (batch,)
+            set_embedding: Current expert set embedding, shape (batch, mlp_hidden_dim)
+        """
+        # Get target dtype from termination head weights (this is the model's dtype)
+        target_dtype = self.termination_head[0].weight.dtype
+        
+        # Cast hidden states to match model dtype
+        h = hidden_states.to(dtype=target_dtype)  # [batch, hidden_size]
+        
+        # Compute set embedding for current option (will use target_dtype internally)
+        s = self._compute_set_embedding(current_expert_indices, target_dtype=target_dtype)  # [batch, mlp_hidden_dim]
+        
+        # Termination head: depends on both h and current option s
+        term_input = torch.cat([h, s], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
+        switch_logits = self.termination_head(term_input).squeeze(-1)  # [batch]
+        
+        # Selection head: depends only on h (like router)
+        candidate_logits = self.selection_head(h)  # [batch, num_experts]
+        
+        # V head: depends only on h
+        value = self.value_head(h).squeeze(-1)  # [batch]
+        
+        # Cast outputs to float32 for numerical stability in loss computation
+        return switch_logits.float(), candidate_logits.float(), value.float(), s.float()
+    
+    def compute_q_option(
+        self,
+        hidden_states: torch.Tensor,  # LLM hidden states [batch, hidden_size]
+        selected_indices: torch.Tensor,  # Expert set to evaluate [batch, k]
+    ) -> torch.Tensor:
+        """
+        Compute Q_U(s, option) for a given expert set.
+        
+        Args:
+            hidden_states: LLM hidden states, shape (batch, hidden_size)
+            selected_indices: Indices of expert set to evaluate, shape (batch, k)
+            
+        Returns:
+            q_u: Q_U(s, option), shape (batch,)
+        """
+        # Get target dtype from q_head weights
+        target_dtype = self.q_head[0].weight.dtype
+        
+        # Cast hidden states to match model dtype
+        h = hidden_states.to(dtype=target_dtype)  # [batch, hidden_size]
+        
+        # Compute set embedding for the option
+        s = self._compute_set_embedding(selected_indices, target_dtype=target_dtype)  # [batch, mlp_hidden_dim]
+        
+        # Q head
+        q_input = torch.cat([h, s], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
+        q_u = self.q_head(q_input).squeeze(-1)  # [batch]
+        
+        # Return float32 for numerical stability
+        return q_u.float()
 
 
 @use_kernel_forward_from_hub("MegaBlocksMoeMLP")
@@ -385,9 +828,19 @@ class GptOssMLP(nn.Module):
         self.controller_allowed_experts = getattr(config, "controller_allowed_experts", self.router.top_k)
         self.controller_switch_threshold = getattr(config, "controller_switch_threshold", 0.5)
         self.controller_sampling_temperature = max(getattr(config, "controller_sampling_temperature", 1.0), 1e-5)
+        self.controller_type = getattr(config, "controller_type", "rnn")  # "rnn" or "activation"
         self.layer_idx: Optional[int] = None
         if self.controller_enabled:
-            self.controller = GptOssController(config)
+            if self.controller_type == "activation":
+                # Activation-based controller: uses LLM hidden states directly
+                self.controller = GptOssActivationController(
+                    config=config,
+                    router_weight=self.router.weight.data.clone(),
+                    router_bias=self.router.bias.data.clone() if self.router.bias is not None else None,
+                )
+            else:
+                # RNN-based controller (default)
+                self.controller = GptOssController(config)
         else:
             self.controller = None
 
@@ -456,10 +909,12 @@ class GptOssMLP(nn.Module):
     def _apply_controller_step(
         self,
         router_softmax: torch.Tensor,  # Already softmaxed router logits
+        router_logits: torch.Tensor,   # Raw router logits for residual connection
         allowed_mask: Optional[torch.Tensor],
         hidden_state: Optional[torch.Tensor],  # RNN hidden state (not output logits)
         runtime_config,
         replay_payload: Optional[Dict[str, torch.Tensor]] = None,
+        mlp_hidden_states: Optional[torch.Tensor] = None,  # MLP input hidden states (for hidden_states input type)
     ) -> tuple[
         torch.Tensor,  # switch_decision
         torch.Tensor,  # allowed_mask
@@ -468,39 +923,60 @@ class GptOssMLP(nn.Module):
         torch.Tensor,  # selection_logprob
         torch.Tensor,  # selected_indices
         torch.Tensor,  # value
-        torch.Tensor,  # controller_input (for recording: [router_softmax, expert_mask])
+        torch.Tensor,  # controller_input (for recording)
     ]:
         """
         Apply one step of the canonical RNN controller.
         
         Canonical RNN architecture:
-            h_t = GRU(h_{t-1}, x_t)  where x_t = [router_softmax, expert_mask]
+            h_t = GRU(h_{t-1}, x_t)
+            - If input_type="router_softmax": x_t = [router_softmax, expert_mask]
+            - If input_type="hidden_states": x_t = [mlp_hidden_states, expert_mask]
             switch_logits, candidate_logits, value = heads(h_t)
+            candidate_logits = router_logits + controller_perturbation (RESIDUAL)
         
         The hidden state h carries temporal information, enabling better
         value estimation and more informed decisions.
+        
+        The residual connection ensures the controller starts from the router's
+        preferences and learns perturbations, providing gradient diversity.
         """
         batch_size, num_experts = router_softmax.shape
+        device = router_softmax.device
+        dtype = router_softmax.dtype
         
         # Initialize allowed_mask if None
         if allowed_mask is None:
-            allowed_mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=router_softmax.device)
+            allowed_mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
         
         # Initialize hidden state if None
         if hidden_state is None:
-            hidden_state = self.controller.init_hidden(batch_size, router_softmax.device, router_softmax.dtype)
+            hidden_state = self.controller.init_hidden(batch_size, device, dtype)
         
-        # Prepare input x_t = [router_softmax, expert_mask]
-        expert_mask_float = allowed_mask.to(dtype=router_softmax.dtype)
-        x_t = torch.cat([router_softmax, expert_mask_float], dim=-1)  # [batch, 2*num_experts]
+        # Prepare input x_t based on controller input type
+        expert_mask_float = allowed_mask.to(dtype=dtype)
+        if self.controller.input_type == "hidden_states":
+            # Use MLP hidden states as input (richer information)
+            if mlp_hidden_states is None:
+                raise ValueError("mlp_hidden_states must be provided when controller_input_type='hidden_states'")
+            x_t = torch.cat([mlp_hidden_states.to(dtype=dtype), expert_mask_float], dim=-1)
+        else:
+            # Default: use router_softmax as input
+            x_t = torch.cat([router_softmax, expert_mask_float], dim=-1)  # [batch, 2*num_experts]
         
         # Forward through canonical RNN controller
-        h_t, switch_logits, candidate_logits, value = self.controller(x_t, hidden_state)
+        h_t, switch_logits, controller_perturbation, value = self.controller(x_t, hidden_state)
+        
+        # RESIDUAL CONNECTION: candidate_logits = router_logits + controller_perturbation
+        # This ensures the controller starts from router's preferences and learns perturbations.
+        # Benefits: (1) Better initialization, (2) Gradient diversity across samples
+        candidate_logits = router_logits.to(controller_perturbation.dtype) + controller_perturbation
         
         # Clamp outputs to prevent numerical issues (NaN in softmax/multinomial)
+        # Clamp logits to prevent numerical issues (NaN in softmax/multinomial)
         switch_logits = switch_logits.clamp(-20, 20)
         candidate_logits = candidate_logits.clamp(-20, 20)
-        value = value.clamp(-100, 100)
+        # Note: value is NOT clamped - no numerical stability concern for arithmetic
         
         if self.controller_sampling_temperature != 1.0:
             candidate_logits = candidate_logits / self.controller_sampling_temperature
@@ -508,6 +984,15 @@ class GptOssMLP(nn.Module):
         switch_probs = torch.sigmoid(switch_logits)
         sampling_mode = _runtime_flag(runtime_config, "sampling", False) and replay_payload is None
         generator = _runtime_get(runtime_config, "generator", None)
+        
+        # DEBUG: Print switch_logits on first few calls to diagnose high switch rate
+        if not hasattr(self, '_debug_switch_count'):
+            self._debug_switch_count = 0
+        if self._debug_switch_count < 5:
+            print(f"  [DEBUG-SWITCH-INFERENCE] switch_logits: mean={switch_logits.mean().item():.4f}, "
+                  f"min={switch_logits.min().item():.4f}, max={switch_logits.max().item():.4f}, "
+                  f"switch_probs: mean={switch_probs.mean().item():.4f}", flush=True)
+            self._debug_switch_count += 1
         
         # Determine switch decision
         if replay_payload is not None:
@@ -558,7 +1043,10 @@ class GptOssMLP(nn.Module):
         if active.numel() > 0:
             allowed_mask = allowed_mask.clone()
             allowed_mask[active] = False
-            allowed_mask.scatter_(1, selected_indices[active], True)
+            # Use scatter on the selected rows, then assign back
+            # (allowed_mask.scatter_ with selected_indices[active] would incorrectly
+            # scatter into rows 0,1,2,... instead of the actual active row indices)
+            allowed_mask[active] = allowed_mask[active].scatter(1, selected_indices[active], True)
 
         return (
             switch_decision,
@@ -571,6 +1059,119 @@ class GptOssMLP(nn.Module):
             x_t,  # Controller input for recording (simplified: just x_t)
         )
 
+    def _apply_activation_controller_step(
+        self,
+        router_logits: torch.Tensor,   # Raw router logits for residual connection
+        current_expert_indices: torch.Tensor,  # [batch, k] - current option (expert set)
+        llm_hidden_states: torch.Tensor,  # [batch, hidden_size] - LLM hidden states (pre-MLP)
+        runtime_config,
+        replay_payload: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> tuple[
+        torch.Tensor,  # switch_decision
+        torch.Tensor,  # new_expert_indices (new option if switch, else same)
+        torch.Tensor,  # switch_logprob
+        torch.Tensor,  # selection_logprob
+        torch.Tensor,  # selected_indices
+        torch.Tensor,  # value
+        torch.Tensor,  # q_u_old (Q value for current option)
+    ]:
+        """
+        Apply one step of the activation-based controller.
+        
+        Activation controller architecture:
+            - Termination head: MLP(concat(h, s)) → switch_logits
+            - Selection head: Linear(h) + router_logits (residual) → candidate_logits
+            - V head: Linear(h) → value
+            - Q head: MLP(concat(h, s)) → Q_U(s, option)
+            
+        Where h = LLM hidden states, s = DeepSets embedding of current expert set.
+        """
+        batch_size, num_experts = router_logits.shape
+        device = router_logits.device
+        dtype = router_logits.dtype
+        
+        # Forward through activation controller
+        # Returns: switch_logits, candidate_logits, value, set_embedding
+        switch_logits, candidate_logits, value, _ = self.controller(
+            hidden_states=llm_hidden_states,
+            current_expert_indices=current_expert_indices,
+        )
+        
+        # Compute Q_U_old (value of current option) for training
+        q_u_old = self.controller.compute_q_option(llm_hidden_states, current_expert_indices)
+        
+        # Clamp outputs to prevent numerical issues
+        switch_logits = switch_logits.clamp(-20, 20)
+        candidate_logits = candidate_logits.clamp(-20, 20)
+        
+        if self.controller_sampling_temperature != 1.0:
+            candidate_logits = candidate_logits / self.controller_sampling_temperature
+        
+        switch_probs = torch.sigmoid(switch_logits)
+        sampling_mode = _runtime_flag(runtime_config, "sampling", False) and replay_payload is None
+        generator = _runtime_get(runtime_config, "generator", None)
+        
+        # DEBUG: Print switch_logits and compare candidate_logits vs router_logits on first few calls
+        if not hasattr(self, '_debug_act_switch_count'):
+            self._debug_act_switch_count = 0
+        if self._debug_act_switch_count < 3:
+            # Compare top-k selection between router and selection_head
+            router_top = torch.topk(router_logits, self.controller_allowed_experts, dim=-1).indices
+            candidate_top = torch.topk(candidate_logits, self.controller_allowed_experts, dim=-1).indices
+            match_rate = (router_top == candidate_top).float().mean().item()
+            weight_diff = (self.router.weight.data.float() - self.controller.selection_head.weight.data.float()).abs().max().item()
+            print(f"  [DEBUG-ACT] switch_prob={switch_probs.mean().item():.4f}, "
+                  f"top-{self.controller_allowed_experts}_match={match_rate:.4f}, "
+                  f"weight_diff={weight_diff:.6f}", flush=True)
+            self._debug_act_switch_count += 1
+        
+        # Determine switch decision
+        if replay_payload is not None:
+            switch_decision = replay_payload["switches"].to(dtype=torch.bool, device=device)
+        elif sampling_mode:
+            bernoulli_p = switch_probs.clamp(min=1e-6, max=1 - 1e-6)
+            rand = torch.rand(switch_probs.shape, device=device, dtype=switch_probs.dtype, generator=generator)
+            switch_decision = rand < bernoulli_p
+        else:
+            switch_decision = switch_probs >= self.controller_switch_threshold
+        
+        # Compute switch log probability
+        switch_logprob = torch.where(
+            switch_decision,
+            _safe_logprob(switch_probs),
+            _safe_log1m(switch_probs),
+        )
+        
+        # Expert selection
+        if replay_payload is not None:
+            selected_indices = replay_payload["selected_indices"].to(dtype=torch.long, device=device)
+            selection_logprob = _plackett_luce_logprob(candidate_logits, selected_indices)
+        elif sampling_mode:
+            selected_indices, selection_logprob = _plackett_luce_sample(
+                candidate_logits,
+                self.controller_allowed_experts,
+                generator=generator,
+            )
+        else:
+            selected_indices = torch.topk(candidate_logits, self.controller_allowed_experts, dim=-1).indices
+            selection_logprob = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        
+        # Update expert indices: if switch, use new selection; otherwise keep current
+        new_expert_indices = torch.where(
+            switch_decision.unsqueeze(-1).expand(-1, selected_indices.shape[-1]),
+            selected_indices,
+            current_expert_indices,
+        )
+        
+        return (
+            switch_decision,
+            new_expert_indices,
+            switch_logprob,
+            selection_logprob,
+            selected_indices,
+            value,
+            q_u_old,
+        )
 
     def forward(
         self,
@@ -587,14 +1188,17 @@ class GptOssMLP(nn.Module):
         router_logits = self.router.compute_router_logits(hidden_states).view(batch_size, seq_len, -1)
         allowed_mask = controller_state.allowed_mask if controller_state is not None else None
         hidden_state = controller_state.hidden_state if controller_state is not None else None
+        # For activation controller, track current_expert_indices instead of hidden_state
+        current_expert_indices = controller_state.current_expert_indices if (controller_state is not None and hasattr(controller_state, 'current_expert_indices')) else None
         
-        # Traces for recording (canonical RNN architecture)
+        # Traces for recording
         switch_trace = []
         switch_logprob_trace = []
         selection_logprob_trace = []
         selected_indices_trace = []
         value_trace = []
-        controller_input_trace = []  # x_t = [router_softmax, expert_mask]
+        q_u_old_trace = []  # For activation controller
+        controller_input_trace = []  # x_t = [router_softmax, expert_mask] for RNN
         router_logits_trace = []
 
         layer_idx = getattr(self, "layer_idx", None)
@@ -607,46 +1211,40 @@ class GptOssMLP(nn.Module):
         record_logprobs = _runtime_get(controller_runtime, "record_logprobs", None)
 
         # Determine if this is the very first token (no prior controller state)
-        # Only the first token (t=0) uses router top-k to initialize
-        # All subsequent tokens (t>0, whether prefill or generation) use normal controller operation
         is_first_forward = controller_state is None
+        use_activation_controller = self.controller_type == "activation"
         
         for token_idx in range(seq_len):
             token_logits = router_logits[:, token_idx, :]
+            token_hidden = hidden_states[:, token_idx, :]  # LLM hidden states for this token
             # Convert router logits to softmax for controller input (consistent with training)
-            # Clamp to avoid numerical issues (same as training)
             router_softmax = torch.softmax(token_logits.float().clamp(-50, 50), dim=-1).to(token_logits.dtype)
             is_first_token = token_idx == 0 and is_first_forward
-            use_replay = layer_replay is not None
             
             if is_first_token:
                 # t=0: Initialize with router top-k, no switch decision
-                # Initialize hidden state and allowed_mask
                 allowed_mask = torch.zeros_like(token_logits, dtype=torch.bool)
                 top_allowed = torch.topk(token_logits, self.controller_allowed_experts, dim=-1).indices
                 allowed_mask.scatter_(1, top_allowed, True)
-                hidden_state = self.controller.init_hidden(token_logits.shape[0], token_logits.device, token_logits.dtype)
                 switch_decision = torch.zeros(token_logits.shape[0], dtype=torch.bool, device=token_logits.device)
-                # Use float32 for log probabilities and value (controller outputs are float32 for numerical stability)
                 switch_logprob = torch.zeros(token_logits.shape[0], dtype=torch.float32, device=token_logits.device)
                 selection_logprob = torch.zeros(token_logits.shape[0], dtype=torch.float32, device=token_logits.device)
-                selected_indices = torch.full(
-                    (token_logits.shape[0], self.controller_allowed_experts),
-                    -1,
-                    dtype=torch.long,
-                    device=token_logits.device,
-                )
+                selected_indices = top_allowed
                 value = torch.zeros(token_logits.shape[0], dtype=torch.float32, device=token_logits.device)
-                # Controller input for recording: x_t = [router_softmax, expert_mask]
+                q_u_old = torch.zeros(token_logits.shape[0], dtype=torch.float32, device=token_logits.device)
                 controller_input = torch.cat([router_softmax, allowed_mask.to(dtype=token_logits.dtype)], dim=-1)
                 
-                # Run controller to initialize hidden state for t=1
-                # This ensures t=0's hidden state captures the initial context
-                x_t = controller_input
-                hidden_state, _, _, _ = self.controller(x_t, hidden_state)
+                if use_activation_controller:
+                    # Initialize current_expert_indices with router top-k
+                    current_expert_indices = top_allowed
+                    # No need to run controller at t=0 for activation controller
+                else:
+                    # RNN controller: initialize hidden state and run forward to prepare for t=1
+                    hidden_state = self.controller.init_hidden(token_logits.shape[0], token_logits.device, token_logits.dtype)
+                    x_t = controller_input
+                    hidden_state, _, _, _ = self.controller(x_t, hidden_state)
             else:
-                # t>0: Normal controller operation (both prefill and generation)
-                # Controller can decide to switch experts based on learned policy
+                # t>0: Normal controller operation
                 replay_payload = None
                 if layer_replay is not None:
                     replay_payload = {
@@ -654,31 +1252,57 @@ class GptOssMLP(nn.Module):
                         "selected_indices": layer_replay["selected_indices"][:, token_idx],
                     }
                 
-                (
-                    switch_decision,
-                    allowed_mask,
-                    hidden_state,  # Canonical RNN: hidden state
-                    switch_logprob,
-                    selection_logprob,
-                    selected_indices,
-                    value,
-                    controller_input,  # x_t = [router_softmax, expert_mask]
-                ) = self._apply_controller_step(
-                    router_softmax,  # Pass softmax instead of raw logits
-                    allowed_mask,
-                    hidden_state,  # Pass hidden state
-                    controller_runtime,
-                    replay_payload=replay_payload,
-                )
+                if use_activation_controller:
+                    # Activation controller: use LLM hidden states + current expert indices
+                    (
+                        switch_decision,
+                        current_expert_indices,  # updated if switch=1
+                        switch_logprob,
+                        selection_logprob,
+                        selected_indices,
+                        value,
+                        q_u_old,
+                    ) = self._apply_activation_controller_step(
+                        token_logits,    # Raw router logits for residual connection
+                        current_expert_indices,  # Current option (expert set)
+                        token_hidden,    # LLM hidden states
+                        controller_runtime,
+                        replay_payload=replay_payload,
+                    )
+                    # Update allowed_mask based on current_expert_indices
+                    allowed_mask = torch.zeros_like(token_logits, dtype=torch.bool)
+                    allowed_mask.scatter_(1, current_expert_indices, True)
+                    controller_input = torch.cat([router_softmax, allowed_mask.to(dtype=token_logits.dtype)], dim=-1)
+                else:
+                    # RNN controller
+                    (
+                        switch_decision,
+                        allowed_mask,
+                        hidden_state,
+                        switch_logprob,
+                        selection_logprob,
+                        selected_indices,
+                        value,
+                        controller_input,
+                    ) = self._apply_controller_step(
+                        router_softmax,
+                        token_logits,
+                        allowed_mask,
+                        hidden_state,
+                        controller_runtime,
+                        replay_payload=replay_payload,
+                    )
+                    q_u_old = torch.zeros(token_logits.shape[0], dtype=torch.float32, device=token_logits.device)
             
-            # Record traces
-            router_logits_trace.append(token_logits.detach())
+            # Record traces BEFORE masking
+            router_logits_trace.append(token_logits.detach().clone())
             switch_trace.append(switch_decision)
             switch_logprob_trace.append(switch_logprob)
             selection_logprob_trace.append(selection_logprob)
             selected_indices_trace.append(selected_indices)
             value_trace.append(value)
-            controller_input_trace.append(controller_input.detach())
+            q_u_old_trace.append(q_u_old)
+            controller_input_trace.append(controller_input.detach().clone())
             
             # Apply mask to router logits
             masked_logits = token_logits.masked_fill(~allowed_mask, torch.finfo(token_logits.dtype).min)
@@ -697,10 +1321,19 @@ class GptOssMLP(nn.Module):
             stacked_scores.view(-1, self.router.num_experts),
             routing_data=stacked_scores.view(-1, self.router.num_experts),
         )
-        next_state = GptOssControllerLayerState(
-            allowed_mask=allowed_mask,
-            hidden_state=hidden_state,  # Canonical RNN: pass hidden state
-        )
+        
+        # Build next state based on controller type
+        if use_activation_controller:
+            next_state = GptOssControllerLayerState(
+                allowed_mask=allowed_mask,
+                hidden_state=None,
+                current_expert_indices=current_expert_indices,
+            )
+        else:
+            next_state = GptOssControllerLayerState(
+                allowed_mask=allowed_mask,
+                hidden_state=hidden_state,
+            )
 
         if record_actions is not None and layer_idx is not None:
             new_record = {
@@ -709,8 +1342,10 @@ class GptOssMLP(nn.Module):
                 "selection_logprobs": torch.stack(selection_logprob_trace, dim=1),
                 "selected_indices": torch.stack(selected_indices_trace, dim=1),
                 "values": torch.stack(value_trace, dim=1),
+                "q_u_old_values": torch.stack(q_u_old_trace, dim=1),  # For activation controller
                 "router_logits": torch.stack(router_logits_trace, dim=1),
-                "controller_inputs": torch.stack(controller_input_trace, dim=1),  # x_t = [router_softmax, expert_mask]
+                "controller_inputs": torch.stack(controller_input_trace, dim=1),
+                "llm_hidden_states": hidden_states.detach().clone(),
             }
             if layer_idx in record_actions:
                 prev_record = record_actions[layer_idx]
@@ -992,7 +1627,9 @@ class GptOssPreTrainedModel(PreTrainedModel):
         "hidden_states": GptOssDecoderLayer,
         "attentions": GptOssAttention,
     }
-    _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm", "controller"]
+    # Note: "controller" is not in _keep_in_fp32_modules because it may not exist when controller_enabled=False
+    # Controller modules are kept in fp32 via explicit handling in GptOssController.__init__
+    _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm"]
     _supports_flash_attention = False
     _supports_flex_attention = False
 
@@ -1000,15 +1637,15 @@ class GptOssPreTrainedModel(PreTrainedModel):
         std = self.config.initializer_range
         if isinstance(module, GptOssController):
             # Canonical RNN Controller initialization:
-            # - GRU cell: Xavier for input-hidden, orthogonal for hidden-hidden
+            # - LayerNormGRU cell: Xavier for input-hidden, orthogonal for hidden-hidden
             # - Output heads: Xavier with zero bias
             # NOTE: Some init functions (orthogonal) don't support bfloat16,
             # so we do init in float32 and convert back to original dtype
             hidden_dim = module.hidden_dim
             input_dim = module.input_dim
             
-            # GRU cell has weight_ih (input-hidden) and weight_hh (hidden-hidden)
-            # Each contains gates: reset (r), update (z), new (n) stacked as [r, z, n]
+            # LayerNormGRUCell has weight_ih, weight_hh, bias_r, bias_z, bias_n
+            # Weights contain gates: reset (r), update (z), new (n) stacked as [r, z, n]
             gru = module.gru_cell
             with torch.no_grad():
                 # Save original dtype for conversion back
@@ -1030,21 +1667,90 @@ class GptOssPreTrainedModel(PreTrainedModel):
                     nn.init.orthogonal_(weight_hh_f32[start:end])
                 gru.weight_hh.data.copy_(weight_hh_f32.to(orig_dtype))
                 
-                # Biases: zero
-                if gru.bias_ih is not None:
-                    gru.bias_ih.data.zero_()
-                if gru.bias_hh is not None:
-                    gru.bias_hh.data.zero_()
+                # Initialize biases or LayerNorm depending on which is present
+                # When use_layer_norm=True, LN provides the bias; when False, explicit biases are used
+                if gru.bias_r is not None:
+                    gru.bias_r.data.zero_()
+                if gru.bias_z is not None:
+                    gru.bias_z.data.zero_()
+                if gru.bias_n is not None:
+                    gru.bias_n.data.zero_()
+                
+                # LayerNorm weights are already initialized to 1 and bias to 0 by default
+                # but we can be explicit about it (now we have 6 LN modules: ri, zi, ni, rh, zh, nh)
+                for ln_name in ['ln_ri', 'ln_zi', 'ln_ni', 'ln_rh', 'ln_zh', 'ln_nh']:
+                    if hasattr(gru, ln_name):
+                        ln = getattr(gru, ln_name)
+                        if ln is not None:
+                            ln.weight.data.fill_(1.0)
+                            ln.bias.data.zero_()
             
-            # Output heads: Xavier with zero bias
-            # Also need float32 for some edge cases
+            # Output heads initialization:
+            # - switch_head: SMALL init (0.01) so bias dominates initially
+            #   Without this, Xavier init gives |w @ h| ≈ 0.7-1.4 which overwhelms the -3 bias
+            #   and causes switch_rate to explode in the first few training steps.
+            # - expert_head: SMALL init (0.01) for residual connection
+            #   (we want controller_perturbation ≈ 0 at init, so candidate_logits ≈ router_logits)
+            # - value_head: SMALL init (0.01) so V ≈ 0 initially
+            #   This ensures termination advantage (Q - V + η) ≈ η from the start
             with torch.no_grad():
-                for head in [module.switch_head, module.expert_head, module.value_head]:
-                    orig_dtype = head.weight.dtype
-                    weight_f32 = head.weight.data.float()
-                    nn.init.xavier_uniform_(weight_f32)
-                    head.weight.data.copy_(weight_f32.to(orig_dtype))
-                    head.bias.data.zero_()
+                # value_head: Small Xavier initialization (0.01x scale)
+                orig_dtype = module.value_head.weight.dtype
+                weight_f32 = module.value_head.weight.data.float()
+                nn.init.xavier_uniform_(weight_f32)
+                weight_f32 *= 0.01  # Small weights so V ≈ 0 initially
+                module.value_head.weight.data.copy_(weight_f32.to(orig_dtype))
+                module.value_head.bias.data.zero_()
+                
+                # switch_head: SMALL initialization (0.01x)
+                # This ensures the bias (-3.0) dominates at init, giving ~5% switch rate
+                # Without this, w @ h ≈ 0.7-1.4 and switch_rate explodes to 30%+ immediately
+                orig_dtype = module.switch_head.weight.dtype
+                weight_f32 = module.switch_head.weight.data.float()
+                nn.init.xavier_uniform_(weight_f32)
+                weight_f32 *= 0.01  # Small weights so bias dominates
+                module.switch_head.weight.data.copy_(weight_f32.to(orig_dtype))
+                module.switch_head.bias.data.zero_()  # Will be set to -3.0 by controller_trainer
+                
+                # expert_head: SMALL initialization for residual connection
+                # Scale down by 0.01 so initial perturbations are small
+                orig_dtype = module.expert_head.weight.dtype
+                weight_f32 = module.expert_head.weight.data.float()
+                nn.init.xavier_uniform_(weight_f32)
+                weight_f32 *= 0.01  # Small perturbations at init
+                module.expert_head.weight.data.copy_(weight_f32.to(orig_dtype))
+                module.expert_head.bias.data.zero_()
+                
+                # DeepSets components for Q_U option encoder
+                # expert_embedding: normal init
+                orig_dtype = module.expert_embedding.weight.dtype
+                weight_f32 = module.expert_embedding.weight.data.float()
+                nn.init.normal_(weight_f32, mean=0.0, std=0.02)
+                module.expert_embedding.weight.data.copy_(weight_f32.to(orig_dtype))
+                
+                # deepsets_phi: Xavier init for each linear layer
+                for layer in module.deepsets_phi:
+                    if isinstance(layer, nn.Linear):
+                        orig_dtype = layer.weight.dtype
+                        weight_f32 = layer.weight.data.float()
+                        nn.init.xavier_uniform_(weight_f32)
+                        layer.weight.data.copy_(weight_f32.to(orig_dtype))
+                        if layer.bias is not None:
+                            layer.bias.data.zero_()
+                
+                # q_head: MLP with one hidden layer (separate Q network)
+                # Hidden layer (index 0): normal Xavier for representation learning
+                # Output layer (index 2): small init (0.01) so Q ≈ 0 initially
+                for i, layer in enumerate(module.q_head):
+                    if isinstance(layer, nn.Linear):
+                        orig_dtype = layer.weight.dtype
+                        weight_f32 = layer.weight.data.float()
+                        nn.init.xavier_uniform_(weight_f32)
+                        if i == 2:  # Output layer - small init
+                            weight_f32 *= 0.01
+                        layer.weight.data.copy_(weight_f32.to(orig_dtype))
+                        if layer.bias is not None:
+                            layer.bias.data.zero_()
         elif isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:

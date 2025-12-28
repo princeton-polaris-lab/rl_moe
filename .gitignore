@@ -19,3 +19,5 @@ wandb/
 *.err
 slurm-*.out
 
+# Install script backups
+.transformers_backup_*/

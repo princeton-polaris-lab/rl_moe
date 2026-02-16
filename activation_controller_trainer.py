@@ -14,6 +14,8 @@ Key architecture:
 Where h = LLM hidden state, s = DeepSets embedding of current expert set.
 """
 
+import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -32,6 +34,13 @@ try:
     HAS_WANDB = True
 except ImportError:
     HAS_WANDB = False
+
+# Try to import peft for LoRA (intra-option policy update)
+try:
+    from peft import LoraConfig, get_peft_model, PeftModel
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
 
 # Import from controller_trainer
 from controller_trainer import ControllerTrainerConfig, ControllerRollout
@@ -149,6 +158,23 @@ class ActivationControllerTrainer:
         # Get references to the model's built-in activation controllers
         self.activation_controllers = self._get_model_activation_controllers()
         
+        # =========================================================================
+        # Convert activation controller parameters to float32 AFTER model loading
+        # This is critical because:
+        # - from_pretrained(..., torch_dtype=bfloat16) loads ALL weights in bfloat16
+        # - bfloat16 has only 7 bits of mantissa, giving precision of ~0.02 at magnitude 3.0
+        # - Small gradient updates (e.g., lr=1e-3 * grad=1e-3 = 1e-6) get rounded to 0
+        # =========================================================================
+        if accelerator.is_main_process:
+            sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
+            print(f"[INIT] Activation controller dtype BEFORE conversion: {sample_param.dtype}")
+        
+        self._convert_activation_controllers_to_fp32()
+        
+        if accelerator.is_main_process:
+            sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
+            print(f"[INIT] Activation controller dtype AFTER conversion: {sample_param.dtype}")
+        
         # Explicitly initialize switch/termination head bias (like original ControllerTrainer)
         self._initialize_termination_bias(config.switch_init_bias)
         
@@ -164,18 +190,106 @@ class ActivationControllerTrainer:
             weight_decay=config.weight_decay,
         )
         
-        # Generation config
-        self.generation_config = GenerationConfig(
-            max_new_tokens=config.response_length,
-            do_sample=True,
-            temperature=config.temperature,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        # =====================================================================
+        # Intra-option policy update: LoRA on experts + trainable router
+        # (Harb et al. 2017, Algorithm 1: intra-option policy gradient)
+        # LoRA is applied in train_controller_standalone.py before model loading
+        # =====================================================================
+        self.llm_optimizer = None
+        self.lora_enabled = False
+        self.peft_model = None
+        if config.intra_option_update:
+            if not HAS_PEFT:
+                raise ImportError("peft is required for intra_option_update. Install with: pip install peft")
+            
+            if accelerator.is_main_process:
+                print(f"[INTRA-OPTION] Intra-option policy update enabled")
+                print(f"[INTRA-OPTION] LLM learning rate: {config.intra_option_lr}")
+            
+            # LoRA already applied in train_controller_standalone.py
+            # Check if model is a PeftModel
+            from peft import PeftModel
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            if isinstance(unwrapped, PeftModel):
+                self.peft_model = unwrapped
+                self.lora_enabled = True
+                if accelerator.is_main_process:
+                    print(f"[INTRA-OPTION] Found PeftModel - LoRA is active")
+            else:
+                if accelerator.is_main_process:
+                    print(f"[INTRA-OPTION] Model type: {type(unwrapped)}")
+                    # Check if it's wrapped differently
+                    if hasattr(unwrapped, 'base_model'):
+                        print(f"[INTRA-OPTION] Has base_model - treating as PEFT")
+                        self.lora_enabled = True
+                    else:
+                        print(f"[INTRA-OPTION] WARNING: Model may not have LoRA active")
+            
+            # Create second optimizer for LLM (LoRA + router) parameters
+            llm_params = self._get_llm_trainable_params()
+            if llm_params:
+                self.llm_optimizer = torch.optim.AdamW(
+                    llm_params,
+                    lr=config.intra_option_lr,
+                    weight_decay=config.weight_decay,
+                )
+                if accelerator.is_main_process:
+                    num_llm_params = sum(p.numel() for p in llm_params)
+                    print(f"[INTRA-OPTION] LLM optimizer: {len(llm_params)} param tensors, {num_llm_params:,} total params")
+            else:
+                if accelerator.is_main_process:
+                    print(f"[INTRA-OPTION] WARNING: No LLM trainable parameters found!")
+        
+        # Generation config - token sampling strategy depends on intra-option update
+        # A2OC requires stochastic sampling: the intra-option policy gradient
+        # ∇log π(a|s) * (G - Q) is only unbiased when actions are sampled from π
+        # But if we're NOT doing intra-option updates, greedy decoding is fine
+        # output_logits=True saves raw unprocessed logits at each step to avoid recomputation in KL reward
+        if config.intra_option_update:
+            self.generation_config = GenerationConfig(
+                max_new_tokens=config.response_length,
+                do_sample=True,  # Stochastic sampling for valid policy gradient
+                temperature=config.temperature,  # Control exploration
+                top_p=0.95,  # Nucleus sampling - exclude extremely low probability tokens
+                top_k=0,  # Disable top-k filtering (default is 50, which sets non-top-k to -inf)
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                output_scores=True,  # Keep for backwards compat, but we use logits
+                output_logits=True,  # Raw unprocessed logits (no -inf from top_k filtering)
+                return_dict_in_generate=True,
+            )
+            if accelerator.is_main_process:
+                print(f"[GEN-CONFIG] Stochastic token sampling enabled (temp={config.temperature}, top_p=0.95) for intra-option policy gradient")
+        else:
+            self.generation_config = GenerationConfig(
+                max_new_tokens=config.response_length,
+                do_sample=True,
+                temperature=config.temperature,
+                top_k=0,  # Disable top-k filtering (default is 50, which causes -inf in scores)
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                output_scores=True,  # Keep for backwards compat
+                output_logits=True,  # Raw unprocessed logits (no -inf from top_k filtering)
+                return_dict_in_generate=True,
+            )
+            if accelerator.is_main_process:
+                print(f"[GEN-CONFIG] Token sampling enabled (temp={config.temperature}) without intra-option update")
         
         # Training state
         self.global_step = 0
         self.epoch = 0
+        
+        # Epsilon annealing state for Plackett-Luce selection
+        self._epsilon_start = getattr(config, 'selection_epsilon_start', None)
+        self._epsilon_end = getattr(config, 'selection_epsilon_end', 0.05)
+        self._epsilon_anneal_steps = getattr(config, 'selection_epsilon_anneal_steps', 200)
+        self._epsilon_fixed = getattr(config, 'selection_epsilon', 0.0)
+        
+        # Epsilon annealing state for Q-based selection
+        self._q_epsilon_start = getattr(config, 'q_selection_epsilon_start', None)
+        self._q_epsilon_end = getattr(config, 'q_selection_epsilon_end', 0.05)
+        self._q_epsilon_anneal_steps = getattr(config, 'q_selection_epsilon_anneal_steps', 200)
+        self._q_epsilon_fixed = getattr(config, 'q_selection_epsilon', 0.1)
         
         # Initialize wandb (offline mode) - same as ControllerTrainer
         self.wandb_run = None
@@ -195,27 +309,52 @@ class ActivationControllerTrainer:
                     "per_device_train_batch_size": config.per_device_train_batch_size,
                     "gradient_accumulation_steps": config.gradient_accumulation_steps,
                     "response_length": config.response_length,
-                    "token_decoding": "greedy",
+                    "token_decoding": "stochastic" if config.intra_option_update else "stochastic",
                     "value_coef": config.value_coef,
                     "latency_cost_per_switch": config.latency_cost_per_switch,
                     "switch_init_bias": config.switch_init_bias,
                     "controller_type": "activation",
+                    "intra_option_update": config.intra_option_update,
+                    "intra_option_lr": config.intra_option_lr,
+                    "intra_option_warmup_steps": config.intra_option_warmup_steps,
                 },
             )
             print(f"[WANDB] Initialized in offline mode: {self.wandb_run.dir}")
     
     def _get_moe_layers(self):
-        """Get all MoE layers from the model."""
+        """Get all MoE layers from the model.
+        
+        Uses the same pattern as ControllerTrainer to handle PEFT-wrapped models.
+        Structure for PEFT: peft_model.base_model.model.model.layers
+        Structure for standard: model.model.layers
+        """
         unwrapped = self.accelerator.unwrap_model(self.model)
         if hasattr(unwrapped, 'policy'):
             policy = unwrapped.policy
         else:
             policy = unwrapped
         
-        if hasattr(policy, 'model'):
+        # Handle PEFT-wrapped models: peft_model.base_model.model.model.layers
+        # (Same pattern as ControllerTrainer._convert_controller_to_fp32, _initialize_switch_bias, etc.)
+        layers = None
+        if hasattr(policy, 'base_model') and hasattr(policy.base_model, 'model'):
+            # PEFT wrapped model
+            inner = policy.base_model.model
+            if hasattr(inner, 'model') and hasattr(inner.model, 'layers'):
+                layers = inner.model.layers
+        elif hasattr(policy, 'model') and hasattr(policy.model, 'layers'):
+            # Standard model
             layers = policy.model.layers
-        else:
-            layers = policy.layers
+        
+        if layers is None:
+            raise AttributeError(
+                f"Could not find transformer layers in model. "
+                f"Policy type: {type(policy)}, has 'model': {hasattr(policy, 'model')}, "
+                f"has 'base_model': {hasattr(policy, 'base_model')}"
+            )
+        
+        if self.accelerator.is_main_process:
+            print(f"[INIT] Found {len(layers)} transformer layers")
         
         moe_layers = {}
         for idx, layer in enumerate(layers):
@@ -232,6 +371,8 @@ class ActivationControllerTrainer:
         This should already be set before model loading via the CLI argument.
         We just verify here since the model must be loaded with the correct
         controller_type for the activation controllers to be instantiated.
+        
+        Uses the same pattern as ControllerTrainer for handling PEFT-wrapped models.
         """
         unwrapped = self.accelerator.unwrap_model(self.model)
         if hasattr(unwrapped, 'policy'):
@@ -239,7 +380,25 @@ class ActivationControllerTrainer:
         else:
             policy = unwrapped
         
-        ctrl_type = getattr(policy.config, 'controller_type', 'rnn')
+        # Handle PEFT-wrapped models: peft_model.base_model.model.config
+        # (Same pattern as ControllerTrainer)
+        config = None
+        if hasattr(policy, 'base_model') and hasattr(policy.base_model, 'model'):
+            # PEFT wrapped model
+            inner = policy.base_model.model
+            if hasattr(inner, 'config'):
+                config = inner.config
+        elif hasattr(policy, 'config'):
+            # Standard model
+            config = policy.config
+        
+        if config is None:
+            raise AttributeError(
+                f"Could not find model config. "
+                f"Policy type: {type(policy)}, has 'config': {hasattr(policy, 'config')}"
+            )
+        
+        ctrl_type = getattr(config, 'controller_type', 'rnn')
         if ctrl_type != "activation":
             raise ValueError(
                 f"Model was loaded with controller_type='{ctrl_type}', expected 'activation'. "
@@ -291,6 +450,111 @@ class ActivationControllerTrainer:
             params.extend(ctrl.parameters())
         return params
     
+    def _get_llm_trainable_params(self) -> List[nn.Parameter]:
+        """Get all LLM trainable parameters (LoRA + router).
+        
+        Returns list of parameters for the LLM optimizer.
+        Excludes controller parameters (handled by separate optimizer).
+        """
+        model = self.model
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        policy = model
+        if hasattr(policy, 'policy'):
+            policy = policy.policy
+        
+        params = []
+        
+        # Check if policy is a PEFT model (might have been wrapped before passing to trainer)
+        from peft import PeftModel
+        is_peft = isinstance(policy, PeftModel)
+        
+        if is_peft:
+            # Get all trainable params from PEFT model (LoRA + router)
+            # Exclude controller params (they have separate optimizer)
+            for name, param in policy.named_parameters():
+                if param.requires_grad and "controller" not in name:
+                    params.append(param)
+            if self.accelerator.is_main_process:
+                print(f"[LLM-PARAMS] Found {len(params)} trainable non-controller params from PeftModel")
+        else:
+            # Fallback: just router parameters
+            if hasattr(policy, 'model') and hasattr(policy.model, 'layers'):
+                for layer in policy.model.layers:
+                    # Check both 'feed_forward' and 'mlp' naming conventions
+                    for mlp_name in ['feed_forward', 'mlp']:
+                        if hasattr(layer, mlp_name):
+                            mlp = getattr(layer, mlp_name)
+                            if hasattr(mlp, 'router'):
+                                for param in mlp.router.parameters():
+                                    if param.requires_grad:
+                                        params.append(param)
+            if self.accelerator.is_main_process:
+                print(f"[LLM-PARAMS] Fallback: Found {len(params)} router params (non-PEFT)")
+        
+        return params
+    
+    def _get_current_epsilon(self) -> float:
+        """Compute current Plackett-Luce exploration epsilon based on annealing schedule.
+        
+        If selection_epsilon_start is set, uses linear annealing:
+            ε(step) = max(ε_end, ε_start - (ε_start - ε_end) * step / anneal_steps)
+        
+        Otherwise, returns the fixed selection_epsilon value.
+        
+        Returns:
+            Current epsilon value for Plackett-Luce ε-greedy exploration.
+        """
+        if self._epsilon_start is not None:
+            # Linear annealing from start to end over anneal_steps
+            progress = min(1.0, self.global_step / max(1, self._epsilon_anneal_steps))
+            current_eps = self._epsilon_start - (self._epsilon_start - self._epsilon_end) * progress
+            return max(self._epsilon_end, current_eps)
+        else:
+            # Fixed epsilon (backward compatibility)
+            return self._epsilon_fixed
+    
+    def _get_current_q_epsilon(self) -> float:
+        """Compute current Q-based selection exploration epsilon based on annealing schedule.
+        
+        If q_selection_epsilon_start is set, uses linear annealing:
+            ε(step) = max(ε_end, ε_start - (ε_start - ε_end) * step / anneal_steps)
+        
+        Otherwise, returns the fixed q_selection_epsilon value.
+        
+        Returns:
+            Current epsilon value for Q-based ε-greedy exploration.
+        """
+        if self._q_epsilon_start is not None:
+            # Linear annealing from start to end over anneal_steps
+            progress = min(1.0, self.global_step / max(1, self._q_epsilon_anneal_steps))
+            current_eps = self._q_epsilon_start - (self._q_epsilon_start - self._q_epsilon_end) * progress
+            return max(self._q_epsilon_end, current_eps)
+        else:
+            # Fixed epsilon (backward compatibility)
+            return self._q_epsilon_fixed
+    
+    def _convert_activation_controllers_to_fp32(self) -> None:
+        """Convert all activation controller parameters to float32 AFTER model loading.
+        
+        This must be called after from_pretrained() because:
+        - from_pretrained(..., torch_dtype=bfloat16) loads ALL weights in bfloat16
+        - This overrides any dtype set in __init__
+        
+        bfloat16 has only 7 bits of mantissa, giving precision of ~0.02 at magnitude 3.0.
+        This means small gradient updates (e.g., lr=1e-3 * grad=1e-3 = 1e-6) get rounded to 0.
+        """
+        num_converted = 0
+        for layer_idx, ctrl in self.activation_controllers.items():
+            # Convert each parameter to float32
+            for param in ctrl.parameters():
+                param.data = param.data.float()
+            num_converted += 1
+        
+        if self.accelerator.is_main_process:
+            print(f"[FP32] Converted {num_converted} activation controller modules to float32")
+    
     def _initialize_termination_bias(self, bias_value: float):
         """
         Explicitly initialize termination head bias for ALL activation controllers.
@@ -328,15 +592,287 @@ class ActivationControllerTrainer:
             print(f"[INIT] Initialized termination_head bias for {num_initialized} layers to {bias_value:.2f}")
             print(f"[INIT] Expected initial switch probability: {expected_switch_prob:.4f} ({expected_switch_prob*100:.2f}%)")
     
+    def _set_controller_enabled(self, model, enabled: bool) -> int:
+        """Set controller enabled state for all MoE blocks.
+        
+        Returns number of modules modified.
+        """
+        count = 0
+        for module in model.modules():
+            if hasattr(module, 'controller_enabled'):
+                module.controller_enabled = enabled
+                count += 1
+        return count
+    
+    @torch.no_grad()
+    def _generate_with_teacher_mix(
+        self,
+        queries: torch.Tensor,
+        controller_runtime: dict,
+        policy,
+        max_new_tokens: int,
+        temperature: float,
+        teacher_mix_alpha: float,
+    ) -> tuple:
+        """
+        Generate tokens using teacher-mixed sampling (MiniLLM-style).
+        
+        At each step:
+        1. Get student logits (controller enabled) with student's KV cache
+        2. Get teacher logits (controller disabled) with teacher's KV cache
+        3. Mix: p_mixed = (1 - α) * p_student + α * p_teacher
+        4. Sample from p_mixed
+        5. Compute importance weight: w = p_student / p_mixed
+        
+        Uses TWO SEPARATE KV CACHES (like MiniLLM) for O(n) complexity:
+        - student_past_kv: KV cache for forward passes with controller enabled
+        - teacher_past_kv: KV cache for forward passes with controller disabled
+        
+        References:
+        - Paper: https://arxiv.org/pdf/2306.08543 (MiniLLM, Section 2.2)
+        - Generation: LMOps/dpkd/transformers/src/transformers/generation/utils.py line 2997
+        - Importance weights: LMOps/minillm/minillm/sampler.py lines 112-115
+        
+        Args:
+            queries: [batch, query_len] input token IDs
+            controller_runtime: dict for recording controller actions
+            policy: the model to use for generation
+            max_new_tokens: maximum number of tokens to generate
+            temperature: sampling temperature
+            teacher_mix_alpha: α in p_mixed = (1-α)*p_student + α*p_teacher
+            
+        Returns:
+            sequences: [batch, query_len + response_len] generated sequences
+            student_logits_tensor: [batch, response_len, vocab] student logits at each step
+            importance_weights_tensor: [batch, response_len] importance weights
+        """
+        device = queries.device
+        batch_size = queries.shape[0]
+        query_len = queries.shape[1]
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        
+        # Check if model is PEFT-wrapped (for disabling LoRA on teacher)
+        try:
+            from peft import PeftModel
+            is_peft = isinstance(policy, PeftModel)
+        except ImportError:
+            is_peft = False
+        
+        # Initialize - start with just the query
+        current_ids = queries.clone()  # [batch, current_len]
+        
+        # Track which sequences have finished (hit EOS)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # Storage for outputs
+        student_logits_list = []
+        importance_weights_list = []
+        
+        # TWO SEPARATE KV CACHES - key to O(n) efficiency
+        student_past_kv = None  # KV cache for controller-enabled forward passes
+        teacher_past_kv = None  # KV cache for controller-disabled forward passes
+        
+        # CRITICAL: Must maintain controller_states across generation steps!
+        # Without this, each token is treated as "first token" and gets fresh top-k experts,
+        # meaning NO expert restriction persists across the sequence.
+        student_controller_states = None
+        
+        # Storage to accumulate controller actions incrementally
+        accumulated_actions = {}
+        
+        if self.accelerator.is_main_process:
+            print(f"  [TEACHER-MIX] Starting generation with α={teacher_mix_alpha}, temp={temperature}", flush=True)
+            print(f"  [TEACHER-MIX] Using dual KV-cache approach (O(n) complexity)", flush=True)
+        
+        for step in range(max_new_tokens):
+            # Determine input for this step
+            if student_past_kv is None:
+                # First step: process full query
+                input_ids = current_ids
+                position_ids = None
+            else:
+                # Subsequent steps: only process the new token
+                input_ids = current_ids[:, -1:]
+                # Need to provide correct position_ids for the new token
+                position_ids = torch.tensor([[current_ids.shape[1] - 1]], device=device).expand(batch_size, 1)
+            
+            # Create attention mask for the input
+            attention_mask = (current_ids != pad_token_id).long()
+            
+            # =========================================================================
+            # Step 1: Get STUDENT logits (controller enabled) with student's KV cache
+            # =========================================================================
+            # Clear record_actions for this step's recording
+            # CRITICAL: Must include "sampling": True so controller uses Bernoulli sampling
+            # instead of threshold-based switching (which would give 0 switches with low probs)
+            # Use the same epsilon from controller_runtime (which has annealing applied)
+            step_runtime = {
+                "record_actions": {},
+                "sampling": True,
+                "selection_epsilon": controller_runtime.get("selection_epsilon", self._get_current_epsilon()),
+            }
+            
+            # Add Q-based selection parameters if enabled (same as non-teacher-mix path)
+            # Use annealed epsilon from controller_runtime (passed from _generate_rollout)
+            if getattr(self.config, 'q_based_selection', False):
+                step_runtime["q_based_selection"] = True
+                step_runtime["q_selection_steps"] = getattr(self.config, 'q_selection_steps', 10)
+                step_runtime["q_selection_lr"] = getattr(self.config, 'q_selection_lr', 1.0)
+                step_runtime["q_selection_epsilon"] = controller_runtime.get("q_selection_epsilon", self._get_current_q_epsilon())
+                step_runtime["q_selection_debug"] = getattr(self.config, 'q_selection_debug', False)
+                step_runtime["q_selection_init_w"] = getattr(self.config, 'q_selection_init_w', 2.0)
+            
+            student_outputs = policy(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=student_past_kv,
+                use_cache=True,
+                controller_runtime=step_runtime,
+                controller_states=student_controller_states,  # Maintain expert restriction across tokens!
+            )
+            student_logits = student_outputs.logits[:, -1, :]  # [batch, vocab]
+            student_past_kv = student_outputs.past_key_values
+            # Update controller states for next iteration
+            student_controller_states = getattr(student_outputs, 'controller_states', None)
+            
+            # Accumulate controller actions from this step
+            step_actions = step_runtime.get("record_actions", {})
+            for layer_idx, layer_data in step_actions.items():
+                if layer_idx not in accumulated_actions:
+                    accumulated_actions[layer_idx] = {}
+                for key, value in layer_data.items():
+                    if key not in accumulated_actions[layer_idx]:
+                        accumulated_actions[layer_idx][key] = value
+                    else:
+                        # Concatenate along sequence dimension (dim=1)
+                        accumulated_actions[layer_idx][key] = torch.cat(
+                            [accumulated_actions[layer_idx][key], value], dim=1
+                        )
+            
+            # =========================================================================
+            # Step 2: Get TEACHER logits (controller disabled) with teacher's KV cache
+            # =========================================================================
+            self._set_controller_enabled(policy, False)
+            
+            if is_peft:
+                with policy.disable_adapter():
+                    teacher_outputs = policy(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=teacher_past_kv,
+                        use_cache=True,
+                    )
+            else:
+                teacher_outputs = policy(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=teacher_past_kv,
+                    use_cache=True,
+                )
+            teacher_logits = teacher_outputs.logits[:, -1, :]  # [batch, vocab]
+            teacher_past_kv = teacher_outputs.past_key_values
+            
+            # Re-enable controller for next iteration
+            self._set_controller_enabled(policy, True)
+            
+            # =========================================================================
+            # Step 3: Mix distributions and sample
+            # p_mixed = (1 - α) * p_student + α * p_teacher
+            # Matches MiniLLM: LMOps/dpkd/transformers/.../generation/utils.py line 2997
+            # =========================================================================
+            student_logits_scaled = student_logits / temperature
+            teacher_logits_scaled = teacher_logits / temperature
+            
+            student_probs = F.softmax(student_logits_scaled.float(), dim=-1)
+            teacher_probs = F.softmax(teacher_logits_scaled.float(), dim=-1)
+            
+            # Match MiniLLM exactly: (1 - alpha) * student + alpha * teacher
+            mixed_probs = (1 - teacher_mix_alpha) * student_probs + teacher_mix_alpha * teacher_probs
+            
+            # Sample from mixed distribution
+            next_token = torch.multinomial(mixed_probs, num_samples=1).squeeze(-1)
+            
+            # =========================================================================
+            # Step 4: Compute importance weights
+            # w = p_student / p_mixed
+            # Matches MiniLLM: LMOps/minillm/minillm/sampler.py lines 112-115
+            # =========================================================================
+            student_prob_sampled = student_probs.gather(dim=-1, index=next_token.unsqueeze(-1)).squeeze(-1)
+            mixed_prob_sampled = mixed_probs.gather(dim=-1, index=next_token.unsqueeze(-1)).squeeze(-1)
+            
+            # MiniLLM doesn't clamp importance weights - match exactly
+            importance_weight = student_prob_sampled / mixed_prob_sampled.clamp(min=1e-8)
+            
+            # =========================================================================
+            # Step 5: Handle EOS and update sequence
+            # =========================================================================
+            next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
+            finished = finished | (next_token == eos_token_id)
+            
+            student_logits_list.append(student_logits)
+            importance_weights_list.append(importance_weight)
+            
+            current_ids = torch.cat([current_ids, next_token.unsqueeze(1)], dim=1)
+            
+            # Progress logging every 100 tokens
+            if self.accelerator.is_main_process and (step + 1) % 100 == 0:
+                print(f"  [TEACHER-MIX] Generated {step+1}/{max_new_tokens} tokens, "
+                      f"finished: {finished.sum().item()}/{batch_size}", flush=True)
+            
+            if finished.all():
+                if self.accelerator.is_main_process:
+                    print(f"  [TEACHER-MIX] All sequences finished at step {step+1}", flush=True)
+                break
+        
+        # Copy accumulated actions to controller_runtime
+        controller_runtime["record_actions"] = accumulated_actions
+        
+        # Stack outputs
+        student_logits_tensor = torch.stack(student_logits_list, dim=1)
+        importance_weights_tensor = torch.stack(importance_weights_list, dim=1)
+        
+        responses = current_ids[:, query_len:]
+        
+        if self.accelerator.is_main_process:
+            num_generated = responses.shape[1]
+            print(f"  [TEACHER-MIX] Generated {num_generated} tokens total", flush=True)
+            print(f"  [TEACHER-MIX] Importance weights: mean={importance_weights_tensor.mean().item():.4f}, "
+                  f"std={importance_weights_tensor.std().item():.4f}, "
+                  f"min={importance_weights_tensor.min().item():.4f}, "
+                  f"max={importance_weights_tensor.max().item():.4f}", flush=True)
+            
+            if importance_weights_tensor.mean().item() < 0.5 or importance_weights_tensor.mean().item() > 2.0:
+                print(f"  [TEACHER-MIX] WARNING: Unusual importance weight mean. "
+                      f"Check if student/teacher distributions are very different.", flush=True)
+            
+            # Validate recorded actions
+            if accumulated_actions:
+                first_layer = next(iter(accumulated_actions.keys()))
+                rec_seq_len = accumulated_actions[first_layer].get("switches", torch.tensor([])).shape[1] if "switches" in accumulated_actions[first_layer] else 0
+                expected_len = current_ids.shape[1]
+                if rec_seq_len != expected_len:
+                    print(f"  [TEACHER-MIX] WARNING: recorded_actions seq_len={rec_seq_len} != expected {expected_len}", flush=True)
+                else:
+                    print(f"  [TEACHER-MIX] Recorded actions validated: {len(accumulated_actions)} layers, seq_len={rec_seq_len}", flush=True)
+        
+        return current_ids, student_logits_tensor, importance_weights_tensor
+    
     @torch.no_grad()
     def generate_rollout(
         self,
         queries: torch.Tensor,
+        ground_truth_answers: Optional[List[str]] = None,
     ) -> ControllerRollout:
         """
-        Generate a rollout using the RNN controller (for data collection).
+        Generate a rollout using the controller (for data collection).
         
-        The activation controllers will be trained on the collected data.
+        Args:
+            queries: [batch, query_len] token IDs
+            ground_truth_answers: Optional list of ground truth answer strings for correctness checking
         """
         self.model.eval()
         device = queries.device
@@ -345,10 +881,36 @@ class ActivationControllerTrainer:
             print(f"  [ROLLOUT] GPU {self.accelerator.process_index}: batch_size={queries.shape[0]}", flush=True)
         
         # Set up controller runtime to record actions
+        # Include selection_epsilon for mixed policy exploration (ε-greedy)
+        # Uses annealing schedule if configured (high early, low late)
+        current_epsilon = self._get_current_epsilon()
+        current_q_epsilon = self._get_current_q_epsilon()
+        
+        if self.accelerator.is_main_process:
+            # Log epsilon annealing progress (for whichever is enabled)
+            if self._epsilon_start is not None:
+                print(f"  [ROLLOUT] PL ε-annealing: ε={current_epsilon:.4f} "
+                      f"(step {self.global_step}/{self._epsilon_anneal_steps}, "
+                      f"start={self._epsilon_start:.2f}, end={self._epsilon_end:.2f})", flush=True)
+            if self._q_epsilon_start is not None:
+                print(f"  [ROLLOUT] Q ε-annealing: ε={current_q_epsilon:.4f} "
+                      f"(step {self.global_step}/{self._q_epsilon_anneal_steps}, "
+                      f"start={self._q_epsilon_start:.2f}, end={self._q_epsilon_end:.2f})", flush=True)
+        
         controller_runtime = {
             "sampling": True,
             "record_actions": {},
+            "selection_epsilon": current_epsilon,  # ε-greedy mixture for PL exploration
         }
+        
+        # Add Q-based selection parameters if enabled
+        if getattr(self.config, 'q_based_selection', False):
+            controller_runtime["q_based_selection"] = True
+            controller_runtime["q_selection_steps"] = getattr(self.config, 'q_selection_steps', 10)
+            controller_runtime["q_selection_lr"] = getattr(self.config, 'q_selection_lr', 1.0)
+            controller_runtime["q_selection_epsilon"] = current_q_epsilon  # Use annealed value
+            controller_runtime["q_selection_debug"] = getattr(self.config, 'q_selection_debug', False)
+            controller_runtime["q_selection_init_w"] = getattr(self.config, 'q_selection_init_w', 2.0)
         
         # Get the unwrapped model for generation
         unwrapped = self.accelerator.unwrap_model(self.model)
@@ -357,16 +919,61 @@ class ActivationControllerTrainer:
         else:
             policy = unwrapped
         
-        # Generate responses
-        attention_mask = (queries != self.tokenizer.pad_token_id).long()
+        # Check if teacher-mixed sampling is enabled
+        teacher_mix_alpha = getattr(self.config, 'teacher_mix_alpha', 0.0)
+        importance_weights = None
         
         gen_start = time.time()
-        outputs = policy.generate(
-            input_ids=queries,
-            attention_mask=attention_mask,
-            generation_config=self.generation_config,
-            controller_runtime=controller_runtime,
-        )
+        
+        if teacher_mix_alpha > 0:
+            # =========================================================================
+            # Teacher-mixed sampling (MiniLLM-style)
+            # Sample from: p_mixed = α * p_teacher + (1-α) * p_student
+            # =========================================================================
+            if self.accelerator.is_main_process:
+                print(f"  [ROLLOUT] Using teacher-mixed sampling with α={teacher_mix_alpha}", flush=True)
+            
+            outputs, student_logits, importance_weights = self._generate_with_teacher_mix(
+                queries=queries,
+                controller_runtime=controller_runtime,
+                policy=policy,
+                max_new_tokens=self.config.response_length,
+                temperature=self.config.temperature,
+                teacher_mix_alpha=teacher_mix_alpha,
+            )
+        else:
+            # =========================================================================
+            # Standard generation using HuggingFace's generate()
+            # =========================================================================
+            # Generate responses
+            attention_mask = (queries != self.tokenizer.pad_token_id).long()
+            
+            gen_output = policy.generate(
+                input_ids=queries,
+                attention_mask=attention_mask,
+                generation_config=self.generation_config,
+                controller_runtime=controller_runtime,
+            )
+            
+            # Extract sequences and logits from generation output
+            # With return_dict_in_generate=True, output is GenerateDecoderOnlyOutput
+            outputs = gen_output.sequences  # [batch, query_len + response_len]
+            
+            # IMPORTANT: Use logits (unprocessed) instead of scores (processed)!
+            # When do_sample=True, HuggingFace applies top_k=50 by default, which sets
+            # non-top-k tokens to -inf in scores. This causes NaN in KL divergence.
+            # The logits are raw model output without any processing.
+            generation_logits = getattr(gen_output, 'logits', None)  # Unprocessed (preferred)
+            generation_scores = gen_output.scores if generation_logits is None else None  # Fallback
+            
+            # Stack into [batch, response_len, vocab_size] tensor
+            if generation_logits is not None:
+                student_logits = torch.stack(generation_logits, dim=1)  # [batch, response_len, vocab]
+            elif generation_scores is not None:
+                student_logits = torch.stack(generation_scores, dim=1)  # [batch, response_len, vocab]
+            else:
+                student_logits = None
+        
         gen_time = time.time() - gen_start
         
         # Extract responses (remove query prefix)
@@ -375,6 +982,8 @@ class ActivationControllerTrainer:
         
         if self.accelerator.is_main_process:
             print(f"  [ROLLOUT] Generated {responses.shape[1]} tokens in {gen_time:.1f}s")
+            if student_logits is not None:
+                print(f"  [ROLLOUT] Saved student_logits shape: {student_logits.shape} for KL speedup")
         
         # Compute response lengths and termination flags
         eos_token_id = self.tokenizer.eos_token_id
@@ -406,9 +1015,10 @@ class ActivationControllerTrainer:
         # Get recorded controller actions
         recorded_actions = controller_runtime.get("record_actions", {})
         
-        # Compute rewards
-        rewards, base_rewards, per_token_kl_list = self._compute_rewards(
-            queries, responses, recorded_actions, query_len, response_lengths
+        # Compute rewards - pass student_logits to avoid recomputing in KL reward
+        rewards, base_rewards, per_token_kl_list, correctness_list = self._compute_rewards(
+            queries, responses, recorded_actions, query_len, response_lengths, student_logits,
+            ground_truth_answers=ground_truth_answers,
         )
         
         if self.accelerator.is_main_process:
@@ -425,6 +1035,14 @@ class ActivationControllerTrainer:
                     per_token_kl_tensor[i, :length] = kl[:length]
             per_token_kl_tensor = per_token_kl_tensor.to(queries.device)
         
+        # Convert correctness list to tensor
+        correctness_tensor = None
+        if correctness_list is not None:
+            correctness_tensor = torch.tensor(correctness_list, dtype=torch.bool, device=queries.device)
+            if self.accelerator.is_main_process:
+                num_correct = correctness_tensor.sum().item()
+                print(f"  [ROLLOUT] Correctness: {num_correct}/{batch_size} correct", flush=True)
+        
         return ControllerRollout(
             layer_data=recorded_actions,
             queries=queries,
@@ -435,6 +1053,9 @@ class ActivationControllerTrainer:
             pad_token_id=self.tokenizer.pad_token_id,
             per_token_kl=per_token_kl_tensor,
             terminated=terminated,
+            student_logits=student_logits,
+            correctness=correctness_tensor,
+            importance_weights=importance_weights,
         )
     
     def _compute_rewards(
@@ -444,10 +1065,15 @@ class ActivationControllerTrainer:
         recorded_actions: Dict[int, Dict[str, torch.Tensor]],
         query_len: int,
         response_lengths: torch.Tensor,
+        student_logits: Optional[torch.Tensor] = None,
+        ground_truth_answers: Optional[List[str]] = None,
     ):
         """Compute rewards for the rollout.
         
-        Matches the original ControllerTrainer._compute_rewards exactly.
+        Args:
+            student_logits: [batch, response_len, vocab_size] - pre-computed logits from generation
+                           If provided, KL reward computation skips student forward pass.
+            ground_truth_answers: Optional list of ground truth answer strings for correctness checking.
         """
         # Decode texts (use clean_up_tokenization_spaces=False to avoid whitespace changes
         # when re-encoding in the reward function)
@@ -483,8 +1109,21 @@ class ActivationControllerTrainer:
                 # Only count switches within valid positions
                 switch_counts += (switches.float() * mask.float()).sum(dim=1)
         
-        # Get base rewards from reward function (matches original signature)
-        base_rewards = self.reward_fn(query_texts, response_texts)
+        # Get base rewards from reward function
+        # Pass original token IDs and recorded_actions for KL reward to ensure exact alignment
+        # (fixes D_gen != D_reward bug by avoiding re-tokenization)
+        # Also pass student_logits to skip student forward pass in KL computation (speedup)
+        input_ids = torch.cat([queries, responses], dim=1)  # [batch, query_len + response_len]
+        base_rewards = self.reward_fn(
+            query_texts, response_texts,
+            recorded_actions=recorded_actions,
+            input_ids=input_ids,
+            left_padding_lengths=left_padding_lengths,
+            response_lengths=response_lengths,
+            query_len=query_len,
+            student_logits=student_logits,
+            ground_truth_answers=ground_truth_answers,
+        )
         
         # Ensure base_rewards is on the same device
         if not isinstance(base_rewards, torch.Tensor):
@@ -526,7 +1165,13 @@ class ActivationControllerTrainer:
                     valid_count = sum(1 for x in per_token_kl if x is not None)
                     print(f"  [OPTION-CRITIC] Retrieved per_token_kl: {valid_count}/{len(per_token_kl)} valid tensors", flush=True)
         
-        return rewards, base_rewards, per_token_kl
+        # Get correctness flags from scorer if available
+        correctness = None
+        if hasattr(self, 'ppl_scorer') and self.ppl_scorer is not None:
+            if hasattr(self.ppl_scorer, 'last_batch_correctness'):
+                correctness = self.ppl_scorer.last_batch_correctness
+        
+        return rewards, base_rewards, per_token_kl, correctness
     
     def _process_single_layer_activation_controller(
         self,
@@ -542,6 +1187,7 @@ class ActivationControllerTrainer:
         valid_mask: torch.Tensor,  # [batch, seq_len]
         valid_end: torch.Tensor,  # [batch, 1]
         terminated: torch.Tensor,  # [batch]
+        importance_weights: Optional[torch.Tensor] = None,  # [batch, seq_len] for off-policy correction
     ) -> Dict[str, Any]:
         """
         Process a single layer with activation-based controller.
@@ -583,10 +1229,12 @@ class ActivationControllerTrainer:
         # Phase 2: BATCHED forward pass - compute V, Q_U_old, Q_U_new, logits
         # =========================================================================
         # Flatten [batch, seq_len, ...] to [batch*seq_len, ...] for batched processing
-        h_flat = llm_hidden_states.view(batch_size * seq_len, hidden_size)  # [B*T, H]
+        # Convert hidden states to float32 to ensure controller computation is in float32
+        # (LLM hidden states may be bf16, which would cause bf16 outputs even with fp32 params)
+        h_flat = llm_hidden_states.view(batch_size * seq_len, hidden_size).float()  # [B*T, H]
         current_option_flat = current_option_per_t.view(batch_size * seq_len, top_k)  # [B*T, k]
         new_option_flat = selected_indices.view(batch_size * seq_len, top_k)  # [B*T, k]
-        router_logits_flat = router_logits.view(batch_size * seq_len, num_experts)  # [B*T, E]
+        router_logits_flat = router_logits.view(batch_size * seq_len, num_experts).float()  # [B*T, E]
         
         # Forward through activation controller (batched)
         switch_logits_flat, candidate_logits_flat, V_flat, _ = controller(
@@ -614,39 +1262,73 @@ class ActivationControllerTrainer:
             if sampling_temp != 1.0:
                 candidate_logits_flat = candidate_logits_flat / sampling_temp
         
-        # Reshape back to [batch, seq_len, ...]
-        V_values = V_flat.view(batch_size, seq_len)
-        Q_U_old_values = Q_U_old_flat.view(batch_size, seq_len)
-        Q_U_new_values = Q_U_new_flat.view(batch_size, seq_len)
-        switch_logits = switch_logits_flat.clamp(-20, 20).view(batch_size, seq_len)
-        candidate_logits_all = candidate_logits_flat.view(batch_size, seq_len, num_experts)
+        # Reshape back to [batch, seq_len, ...] and convert to float32 for numerical stability
+        # Even with fp32 controller params, the computation may involve bf16 intermediates
+        # from the LLM hidden states. Force float32 for all value-related tensors.
+        V_values = V_flat.view(batch_size, seq_len).float()
+        Q_U_old_values = Q_U_old_flat.view(batch_size, seq_len).float()
+        Q_U_new_values = Q_U_new_flat.view(batch_size, seq_len).float()
+        switch_logits = switch_logits_flat.clamp(-20, 20).view(batch_size, seq_len).float()
+        candidate_logits_all = candidate_logits_flat.view(batch_size, seq_len, num_experts).float()
         
         # =========================================================================
-        # Phase 2: Per-token rewards (no deliberation cost - faithful to Harb et al.)
+        # Per-token reward: PURE KL (no deliberation cost)
+        # 
+        # We use the λ=0 regime from Harb et al. "When Waiting is not an Option":
+        # - Critic learns Q-values for the ORIGINAL reward (KL divergence)
+        # - Deliberation cost η appears ONLY in termination advantage: (A + η)
+        # - This keeps the LM policy gradient optimizing pure KL
+        # - Only termination is affected by switching cost
+        #
+        # See paper Section "Computational Horizon" and Equation (10):
+        #   ∂J/∂θ_β = γE[-∂β/∂θ (A_θ + η)]
+        # where A_θ is advantage from ORIGINAL reward (not transformed).
         # =========================================================================
-        per_token_reward = per_token_base_reward
+        # Ensure reward is float32 for numerical stability
+        per_token_reward = per_token_base_reward.float()
+        
+        # =========================================================================
+        # FIX #2: Use Q_exec (executed option's Q) instead of always Q_U_old
+        #
+        # When switches[t]=True, the reward at t is generated under the NEW option.
+        # Training Q_U_old to match returns from a different option is inconsistent.
+        # Q_exec = Q_U_new if switch, Q_U_old otherwise
+        # =========================================================================
+        Q_exec_values = torch.where(switches.bool(), Q_U_new_values, Q_U_old_values)
         
         # =========================================================================
         # Phase 3: Compute TD targets using GAE
+        # 
+        # IMPORTANT: Use explicit float32 for all GAE tensors to avoid bf16 precision loss.
+        # V_values may be in bf16 if model is loaded in bf16, but GAE accumulation needs
+        # higher precision to avoid numeric errors in TD targets.
         # =========================================================================
         gae_lambda = self.config.gae_lambda
         beta_probs = torch.sigmoid(switch_logits)
         
         gae_V = torch.zeros(batch_size, device=device, dtype=torch.float32)
-        gae_Q = torch.zeros(batch_size, device=device, dtype=torch.float32)
-        V_advantages = torch.zeros_like(V_values)
-        Q_advantages = torch.zeros_like(Q_U_old_values)
+        gae_Q_exec = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        # Explicitly use float32 for advantages to avoid bf16 precision loss
+        V_advantages = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        Q_exec_advantages = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
         
         for t in reversed(range(seq_len)):
             r_t = per_token_reward[:, t]
             V_t = V_values[:, t].detach()
-            Q_t = Q_U_old_values[:, t].detach()
+            Q_exec_t = Q_exec_values[:, t].detach()  # Use executed option's Q
             
             if t + 1 < seq_len:
                 next_is_valid = (t + 1) < valid_end.squeeze(1)
                 V_next = V_values[:, t+1].detach()
-                Q_next = Q_U_old_values[:, t+1].detach()
                 beta_next = beta_probs[:, t+1].detach()
+                
+                # =====================================================================
+                # Q bootstrap must use Q of the SAME option at next state
+                # Q_U_old_values[t+1] = Q(s_{t+1}, o_current_at_{t+1})
+                #                     = Q(s_{t+1}, o_executed_at_t)
+                # because the "current" option at t+1 is whatever was executed at t.
+                # =====================================================================
+                Q_continue_next = Q_U_old_values[:, t+1].detach()  # Q of SAME option at next state
                 
                 at_boundary = ~next_is_valid
                 should_bootstrap_at_boundary = at_boundary & ~terminated
@@ -658,114 +1340,291 @@ class ActivationControllerTrainer:
                 )
                 delta_V = r_t + V_bootstrap - V_t
                 
-                soft_bootstrap = gamma * (beta_next * V_next + (1 - beta_next) * Q_next)
+                # Q_exec bootstrap: U(s', o) = β·V(s') + (1-β)·Q(s', o_same)
+                soft_bootstrap = gamma * (beta_next * V_next + (1 - beta_next) * Q_continue_next)
                 Q_bootstrap = torch.where(
                     next_is_valid,
                     soft_bootstrap,
                     torch.where(should_bootstrap_at_boundary, soft_bootstrap, torch.zeros_like(soft_bootstrap))
                 )
-                delta_Q = r_t + Q_bootstrap - Q_t
+                delta_Q_exec = r_t + Q_bootstrap - Q_exec_t
                 
                 should_continue_gae = next_is_valid | should_bootstrap_at_boundary
                 gae_V = torch.where(should_continue_gae, delta_V + gamma * gae_lambda * gae_V, delta_V)
-                gae_Q = torch.where(should_continue_gae, delta_Q + gamma * gae_lambda * gae_Q, delta_Q)
+                gae_Q_exec = torch.where(should_continue_gae, delta_Q_exec + gamma * gae_lambda * gae_Q_exec, delta_Q_exec)
             else:
                 delta_V = r_t - V_t
-                delta_Q = r_t - Q_t
+                delta_Q_exec = r_t - Q_exec_t
                 gae_V = delta_V
-                gae_Q = delta_Q
+                gae_Q_exec = delta_Q_exec
             
             V_advantages[:, t] = gae_V
-            Q_advantages[:, t] = gae_Q
+            Q_exec_advantages[:, t] = gae_Q_exec
         
         V_targets = V_values.detach() + V_advantages
-        Q_U_old_targets = Q_U_old_values.detach() + Q_advantages
+        Q_exec_targets = Q_exec_values.detach() + Q_exec_advantages
         
-        # Debug logging for layer 0
+        # =========================================================================
+        # Compute intra-option returns (for LLM policy gradient)
+        # This is G (discounted return) WITHOUT Q baseline, computed separately
+        # from GAE advantages because intra-option update needs raw returns
+        # =========================================================================
+        intra_option_returns = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        G_accumulator = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        
+        for t in reversed(range(seq_len)):
+            r_t = per_token_reward[:, t]
+            
+            if t + 1 < seq_len:
+                next_is_valid = (t + 1) < valid_end.squeeze(1)
+                at_boundary = ~next_is_valid
+                should_bootstrap_at_boundary = at_boundary & ~terminated
+                
+                # Accumulate discounted return
+                G_accumulator = torch.where(
+                    next_is_valid | should_bootstrap_at_boundary,
+                    r_t + gamma * G_accumulator,
+                    r_t  # At terminal, just immediate reward
+                )
+            else:
+                # Last valid timestep: just immediate reward (terminal)
+                G_accumulator = r_t
+            
+            intra_option_returns[:, t] = G_accumulator
+        
+        # Debug logging for layer 0 (basic stats before t_mask is defined)
         if layer_idx == 0 and self.accelerator.is_main_process:
+            print(f"  [ACT-LAYER0] Intra-option return G (no Q baseline): mean={intra_option_returns[valid_mask].mean().item():.4f}", flush=True)
             print(f"  [ACT-LAYER0] V: mean={V_values[valid_mask].mean().item():.4f}, "
-                  f"Q_U_old: mean={Q_U_old_values[valid_mask].mean().item():.4f}")
+                  f"Q_exec: mean={Q_exec_values[valid_mask].mean().item():.4f}, "
+                  f"Q_U_old (for term): mean={Q_U_old_values[valid_mask].mean().item():.4f}, "
+                  f"Q_U_new (for select): mean={Q_U_new_values[valid_mask].mean().item():.4f}", flush=True)
         
         # =========================================================================
         # Phase 4: Compute advantages
         # =========================================================================
+        # Define t_mask early (needed for RMS norm and losses)
+        # Skip t=0 (no switch decision at first timestep)
+        t_mask = torch.ones(seq_len, device=device, dtype=torch.bool)
+        t_mask[0] = False
+        t_mask = t_mask.unsqueeze(0).expand(batch_size, -1)
+        
+        # Termination advantage: A + η (λ=0 regime from Harb et al.)
+        # Q and V are trained on PURE KL reward (no deliberation cost).
+        # The +η margin appears ONLY here in the termination gradient.
+        # This makes termination more conservative: switch only if Q-V > η.
         adv_term = Q_U_old_values.detach() - V_values.detach() + deliberation_cost
         A_select = Q_U_new_values.detach() - V_values.detach()
+        
+        # Optionally apply RMS normalization to termination advantages
+        # This helps when advantage variance collapses during training
+        if getattr(self.config, 'term_adv_rms_norm', False):
+            term_mask = valid_mask & t_mask
+            adv_term_used = adv_term[term_mask]
+            if adv_term_used.numel() > 1:
+                # RMS = sqrt(mean(x^2)) - preserves sign and mean, just scales magnitude
+                adv_term_rms = torch.sqrt((adv_term_used ** 2).mean()).clamp(min=1e-8)
+                adv_term = adv_term / adv_term_rms
+                if layer_idx == 0 and self.accelerator.is_main_process:
+                    print(f"  [ACT-LAYER0] adv_term RMS norm applied: rms={adv_term_rms.item():.6f}", flush=True)
         
         # =========================================================================
         # Phase 5: Compute losses
         # =========================================================================
         # Value loss: MSE
+        # V_loss: trains V to predict state value
+        # Q_loss: trains Q_exec (the executed option) to predict option value
         V_loss = (V_values - V_targets.detach()) ** 2
-        Q_loss = (Q_U_old_values - Q_U_old_targets.detach()) ** 2
+        Q_loss = (Q_exec_values - Q_exec_targets.detach()) ** 2
         
         # Termination loss (direct gradient, no log-prob - Harb et al. 2017)
-        # Skip t=0 (no switch decision)
-        t_mask = torch.ones(seq_len, device=device, dtype=torch.bool)
-        t_mask[0] = False
-        t_mask = t_mask.unsqueeze(0).expand(batch_size, -1)
-        
+        # t_mask already defined in Phase 4 (skips t=0)
+        # 
+        # Apply importance sampling weights for off-policy correction (teacher-mixed rollouts).
+        # The policy gradient should be weighted by w_t = p_student / p_mixed to correct for
+        # the distribution mismatch. This follows MiniLLM's per-token approximation.
         beta_probs_clamped = beta_probs.clamp(1e-6, 1 - 1e-6)
+        term_loss_raw = adv_term * beta_probs_clamped
+        
+        # Apply importance weights if available
+        if importance_weights is not None:
+            term_loss_raw = importance_weights * term_loss_raw
+        
         term_loss = torch.where(
             valid_mask & t_mask,
-            adv_term * beta_probs_clamped,
+            term_loss_raw,
             torch.zeros_like(adv_term)
         )
         
-        # Selection loss (REINFORCE with log-prob)
-        # Normalize A_select
-        select_mask = switches.bool() & valid_mask & t_mask
-        A_select_used = A_select[select_mask]
-        if A_select_used.numel() > 1:
-            A_select_mean = A_select_used.mean()
-            A_select_std = A_select_used.std().clamp(min=1e-8)
-            A_select_norm = (A_select - A_select_mean) / A_select_std
+        # Selection policy loss: -A_select * log_prob_option (only when switching, t > 0)
+        # Skip if using Q-based selection (no selection policy to train)
+        q_based_selection = getattr(self.config, 'q_based_selection', False)
+        
+        if q_based_selection:
+            # Q-based selection: no selection policy loss
+            # The "policy" is implicitly argmax Q, trained via TD on Q network
+            selection_log_probs = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+            select_loss = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
         else:
-            A_select_norm = A_select
-        
-        # Compute log-prob of selected experts (Plackett-Luce)
-        selection_log_probs = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
-        for t in range(seq_len):
-            logits_t = candidate_logits_all[:, t, :]
-            indices_t = selected_indices[:, t, :]
-            log_prob_t = _plackett_luce_logprob_batched(logits_t, indices_t)
-            selection_log_probs[:, t] = log_prob_t
-        
-        select_loss = torch.where(
-            select_mask,
-            -A_select_norm * selection_log_probs,
-            torch.zeros_like(selection_log_probs)
-        )
+            # Plackett-Luce selection: compute log prob
+            # Normalize A_select
+            select_mask = switches.bool() & valid_mask & t_mask
+            A_select_used = A_select[select_mask]
+            if A_select_used.numel() > 1:
+                A_select_mean = A_select_used.mean()
+                A_select_std = A_select_used.std().clamp(min=1e-8)
+                A_select_norm = (A_select - A_select_mean) / A_select_std
+            else:
+                A_select_norm = A_select
+            
+            # Compute log-prob of selected experts (Plackett-Luce)
+            selection_log_probs = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+            for t in range(seq_len):
+                logits_t = candidate_logits_all[:, t, :]
+                indices_t = selected_indices[:, t, :]
+                log_prob_t = _plackett_luce_logprob_batched(logits_t, indices_t)
+                selection_log_probs[:, t] = log_prob_t
+            
+            # Selection loss with importance weighting for off-policy correction
+            select_loss_raw = -A_select_norm * selection_log_probs
+            
+            # Apply importance weights if available
+            if importance_weights is not None:
+                select_loss_raw = importance_weights * select_loss_raw
+            
+            select_loss = torch.where(
+                select_mask,
+                select_loss_raw,
+                torch.zeros_like(selection_log_probs)
+            )
         
         # Aggregate losses
+        # When using importance weights, normalize by sum of weights instead of count
+        # This gives: mean = sum(w * loss) / sum(w) for importance-weighted losses
         num_valid = valid_mask[:, 1:].sum()
         num_switch = (switches.bool() & valid_mask & t_mask).sum()
         
-        mean_term_loss = term_loss.sum() / max(num_valid, 1)
-        mean_select_loss = select_loss.sum() / max(num_switch, 1)
+        if importance_weights is not None:
+            # Termination: normalize by sum of weights for valid positions (excluding t=0)
+            term_weight_sum = (importance_weights * (valid_mask & t_mask).float()).sum().clamp(min=1e-8)
+            mean_term_loss = term_loss.sum() / term_weight_sum
+            
+            # Selection: normalize by sum of weights for switch positions
+            select_mask = switches.bool() & valid_mask & t_mask
+            select_weight_sum = (importance_weights * select_mask.float()).sum().clamp(min=1e-8)
+            mean_select_loss = select_loss.sum() / select_weight_sum if num_switch > 0 else select_loss.sum()
+        else:
+            mean_term_loss = term_loss.sum() / max(num_valid, 1)
+            mean_select_loss = select_loss.sum() / max(num_switch, 1)
+        
         policy_loss = mean_term_loss + mean_select_loss
         
-        # Value loss: average over valid positions
+        # Value loss: sum over valid positions per batch (matches RNN controller)
+        # RNN: value_loss = (V_loss + Q_loss).sum(dim=1)  # [batch]
+        # Normalization happens later in _compute_single_rollout_loss
+        #
+        # IMPORTANT: Critics must learn on ALL valid timesteps including t=0.
+        # t_mask skips t=0 which is correct for policies (can't switch at t=0),
+        # but critics need to learn V(s_0) and Q(s_0, o) for proper TD bootstrap.
+        # Without this, V[0] stays random noise, corrupting TD targets at t=1, t=2, etc.
+        V_loss_masked = torch.where(valid_mask, V_loss, torch.zeros_like(V_loss))
+        Q_loss_masked = torch.where(valid_mask, Q_loss, torch.zeros_like(Q_loss))
+        value_loss = (V_loss_masked + Q_loss_masked).sum(dim=1)  # [batch]
+        
+        # For logging: compute mean values
         v_mask = valid_mask.float()
         mean_V_loss = (V_loss * v_mask).sum() / max(v_mask.sum(), 1)
         mean_Q_loss = (Q_loss * v_mask).sum() / max(v_mask.sum(), 1)
-        value_loss = mean_V_loss + mean_Q_loss
         
-        # Total loss
-        total_loss = policy_loss + self.config.value_coef * value_loss
+        # Compute expert entropy (for logging and optional entropy bonus)
+        # Higher entropy = more uniform distribution = more diverse expert selection
+        expert_softmax = torch.softmax(candidate_logits_all, dim=-1)  # [batch, seq_len, num_experts]
+        expert_log_softmax = torch.log_softmax(candidate_logits_all, dim=-1)  # numerically stable
+        entropy_per_position = -(expert_softmax * expert_log_softmax).sum(dim=-1)  # [batch, seq_len]
+        # Mean over valid positions only
+        valid_entropy_mask = valid_mask & t_mask
+        expert_entropy = (entropy_per_position * valid_entropy_mask).sum() / valid_entropy_mask.sum().clamp(min=1)
+        
+        # NOTE: Entropy bonus and value_coef scaling are applied at the aggregate level
+        # (in _compute_single_rollout_loss), matching the RNN controller pattern.
+        # Each layer just returns policy_loss (scalar) and value_loss ([batch] tensor).
+        
+        # Compute termination binariness metrics (same as RNN controller)
+        # Binariness = how close switch_probs are to 0 or 1
+        with torch.no_grad():
+            valid_switch_probs = beta_probs[valid_mask & t_mask]
+            if valid_switch_probs.numel() > 0:
+                # Mean switch prob
+                switch_prob_mean = valid_switch_probs.mean().item()
+                # Std of switch probs (lower = more concentrated)
+                switch_prob_std = valid_switch_probs.std().item() if valid_switch_probs.numel() > 1 else 0.0
+                # Fraction that are "binary" (< 0.1 or > 0.9)
+                binary_frac = ((valid_switch_probs < 0.1) | (valid_switch_probs > 0.9)).float().mean().item()
+                # Entropy of switch probs: H = -p*log(p) - (1-p)*log(1-p)
+                # Lower entropy = more binary
+                p = valid_switch_probs.clamp(1e-7, 1 - 1e-7)
+                switch_entropy = (-p * p.log() - (1 - p) * (1 - p).log()).mean().item()
+                
+                # High switch probability metrics
+                switch_prob_max = valid_switch_probs.max().item()
+                switch_prob_p90 = torch.quantile(valid_switch_probs, 0.90).item() if valid_switch_probs.numel() >= 10 else switch_prob_max
+                switch_prob_p95 = torch.quantile(valid_switch_probs, 0.95).item() if valid_switch_probs.numel() >= 20 else switch_prob_max
+                frac_gt_0p1 = (valid_switch_probs > 0.1).float().mean().item()
+                frac_gt_0p5 = (valid_switch_probs > 0.5).float().mean().item()
+            else:
+                switch_prob_mean = 0.0
+                switch_prob_std = 0.0
+                binary_frac = 0.0
+                switch_entropy = 0.0
+                switch_prob_max = 0.0
+                switch_prob_p90 = 0.0
+                switch_prob_p95 = 0.0
+                frac_gt_0p1 = 0.0
+                frac_gt_0p5 = 0.0
+        
+        # Debug logging for layer 0 (termination metrics)
+        if layer_idx == 0 and self.accelerator.is_main_process:
+            print(f"  [ACT-LAYER0] switch_prob: mean={switch_prob_mean:.4f}, std={switch_prob_std:.4f}, "
+                  f"max={switch_prob_max:.4f}, p90={switch_prob_p90:.4f}", flush=True)
+            print(f"  [ACT-LAYER0] switch_binary_frac={binary_frac:.4f}, entropy={switch_entropy:.4f}, "
+                  f"frac>0.1={frac_gt_0p1:.4f}, frac>0.5={frac_gt_0p5:.4f}", flush=True)
         
         return {
-            "loss": total_loss,
-            "policy_loss": policy_loss.item(),
-            "value_loss": value_loss.item(),
+            # Losses for aggregation (matches RNN controller pattern)
+            "policy_loss": policy_loss,  # Tensor (scalar) - already averaged within layer
+            "value_loss": value_loss,    # Tensor [batch] - summed over seq, to be normalized later
+            "expert_entropy": expert_entropy,  # Tensor (scalar) - for entropy bonus
+            # Counts for normalization
+            "num_valid_timesteps": num_valid.item(),
+            "num_switch_timesteps": num_switch.item(),
+            # For logging
             "mean_V_loss": mean_V_loss.item(),
             "mean_Q_loss": mean_Q_loss.item(),
             "mean_term_loss": mean_term_loss.item(),
             "mean_select_loss": mean_select_loss.item(),
             "switch_rate": (switches.bool() & valid_mask & t_mask).float().sum().item() / max(num_valid.item(), 1),
             "V_mean": V_values[valid_mask].mean().item() if valid_mask.sum() > 0 else 0,
+            "Q_exec_mean": Q_exec_values[valid_mask].mean().item() if valid_mask.sum() > 0 else 0,
             "Q_U_old_mean": Q_U_old_values[valid_mask].mean().item() if valid_mask.sum() > 0 else 0,
+            "Q_U_new_mean": Q_U_new_values[valid_mask].mean().item() if valid_mask.sum() > 0 else 0,
             "adv_term_mean": adv_term[valid_mask].mean().item() if valid_mask.sum() > 0 else 0,
+            # For intra-option policy update (Harb et al. 2017, Algorithm 1)
+            "intra_option_advantage": intra_option_returns.detach(),  # [batch, seq_len] - G (raw return)
+            "intra_option_q_values": Q_exec_values.detach(),  # [batch, seq_len] - Q(s,o) for optional baseline
+            "valid_mask": valid_mask,  # [batch, seq_len]
+            # Switch probabilities for TopK regularization (WITH gradients)
+            "switch_probs": beta_probs,  # [batch, seq_len] - keep gradients for TopK loss
+            "t_mask": t_mask,  # [batch, seq_len] - skip t=0
+            # Termination binariness metrics
+            "switch_prob_mean": switch_prob_mean,
+            "switch_prob_std": switch_prob_std,
+            "switch_binary_frac": binary_frac,  # Fraction of switch_probs that are < 0.1 or > 0.9
+            "switch_entropy": switch_entropy,  # Lower = more binary
+            "switch_prob_max": switch_prob_max,
+            "switch_prob_p90": switch_prob_p90,
+            "switch_prob_p95": switch_prob_p95,
+            "frac_gt_0p1": frac_gt_0p1,  # Fraction with switch_prob > 0.1
+            "frac_gt_0p5": frac_gt_0p5,  # Fraction with switch_prob > 0.5
         }
     
     def _compute_single_rollout_loss(
@@ -807,21 +1666,154 @@ class ActivationControllerTrainer:
         per_token_base_reward = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
         kl_response_len = per_token_kl.shape[1]
         
-        # Place per_token_kl at response positions (starting at query_len)
+        # =========================================================================
+        # FIX #1: Place reward at PREDICTION position, not TARGET position
+        # 
+        # For causal LM: the distribution that generates response token j lives at
+        # position (query_len - 1 + j), NOT (query_len + j).
+        # - Response token 0 (at position query_len) is predicted at position query_len - 1
+        # - Response token j (at position query_len + j) is predicted at query_len - 1 + j
+        #
+        # The reward for an action should be placed where the action was taken.
+        # =========================================================================
         for i in range(batch_size):
-            resp_start = query_len
-            available_space = seq_len - resp_start
+            reward_start = query_len - 1  # Position where first response token is predicted
+            available_space = seq_len - reward_start
             actual_resp_len = min(kl_response_len, int(response_lengths[i].item()), available_space)
             if actual_resp_len > 0:
-                per_token_base_reward[i, resp_start:resp_start+actual_resp_len] = -per_token_kl[i, :actual_resp_len]
-        
-        # Normalize rewards by response length
-        response_len_for_norm = response_lengths.float().clamp(min=1.0)
-        per_token_base_reward = per_token_base_reward / response_len_for_norm.unsqueeze(1)
+                per_token_base_reward[i, reward_start:reward_start+actual_resp_len] = -per_token_kl[i, :actual_resp_len]
         
         if self.accelerator.is_main_process:
             print(f"  [OC-FWD] seq_len={seq_len} (query={query_len}, response={seq_len - query_len})", flush=True)
-            print(f"  [OC-FWD] per_token_base_reward: min={per_token_base_reward.min().item():.4f}, max={per_token_base_reward.max().item():.4f}", flush=True)
+            print(f"  [OC-FWD] per_token_kl shape={per_token_kl.shape}, response_lengths={response_lengths.tolist()}", flush=True)
+            print(f"  [OC-FWD] Reward placed at indices [{query_len-1}:{query_len-1}+resp_len] (prediction positions)", flush=True)
+            # Count tokens with non-zero rewards
+            num_rewarded = (per_token_base_reward != 0).sum().item()
+            print(f"  [OC-FWD] Tokens with rewards: {num_rewarded} (expected: batch_size * avg_resp_len)", flush=True)
+        
+        # =========================================================================
+        # Correctness reward bonus: add +alpha uniformly for correct trajectories
+        # =========================================================================
+        correctness_alpha = self.config.correctness_reward_alpha
+        if correctness_alpha > 0 and rollout.correctness is not None:
+            num_correct = 0
+            for i in range(batch_size):
+                if rollout.correctness[i]:
+                    reward_start = query_len - 1
+                    available_space = seq_len - reward_start
+                    actual_resp_len = min(kl_response_len, int(response_lengths[i].item()), available_space)
+                    if actual_resp_len > 0:
+                        per_token_base_reward[i, reward_start:reward_start+actual_resp_len] += correctness_alpha
+                    num_correct += 1
+            if self.accelerator.is_main_process:
+                print(f"  [OC-FWD] Correctness bonus: alpha={correctness_alpha}, "
+                      f"correct={num_correct}/{batch_size}", flush=True)
+        
+        # =========================================================================
+        # Repetition metrics and penalty (distance-based)
+        # For each token at position t, find distance d to previous occurrence
+        # Penalty = c * λ^d (c should be negative, λ < 1 so nearby repeats penalized more)
+        # Always compute metrics for logging, only apply penalty if c != 0
+        # =========================================================================
+        rep_c = self.config.repetition_penalty_c
+        rep_decay = self.config.repetition_penalty_decay
+        
+        # Compute repetition metrics for each sample in batch
+        responses = rollout.responses  # [batch, response_len] - token IDs
+        rep_penalty_tensor = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        
+        # Metrics to track
+        batch_rep_rates = []  # repetition rate per sample: 1 - unique/total
+        batch_num_repeats = []  # number of repeat tokens per sample
+        batch_total_tokens = []  # total tokens per sample
+        
+        for i in range(batch_size):
+            resp_len = int(response_lengths[i].item())
+            if resp_len <= 0:
+                continue
+            
+            # Get response tokens for this sample
+            resp_tokens = responses[i, :resp_len].cpu().tolist()
+            
+            # Track last position of each token
+            last_pos = {}  # token_id -> last position
+            num_repeats = 0
+            
+            for t, token_id in enumerate(resp_tokens):
+                if token_id in last_pos:
+                    num_repeats += 1
+                    # Compute penalty if enabled
+                    if rep_c != 0.0:
+                        d = t - last_pos[token_id]
+                        penalty = rep_c * (rep_decay ** d)
+                        
+                        # Place penalty at the prediction position (query_len - 1 + t)
+                        pred_pos = query_len - 1 + t
+                        if pred_pos < seq_len:
+                            rep_penalty_tensor[i, pred_pos] = penalty
+                
+                # Update last position
+                last_pos[token_id] = t
+            
+            # Compute repetition rate: 1 - unique/total
+            unique_count = len(last_pos)
+            rep_rate = 1.0 - unique_count / resp_len if resp_len > 0 else 0.0
+            batch_rep_rates.append(rep_rate)
+            batch_num_repeats.append(num_repeats)
+            batch_total_tokens.append(resp_len)
+        
+        # Store metrics for wandb logging
+        if batch_rep_rates:
+            self._last_rep_rate_mean = sum(batch_rep_rates) / len(batch_rep_rates)
+            self._last_rep_rate_max = max(batch_rep_rates)
+            self._last_num_repeats_mean = sum(batch_num_repeats) / len(batch_num_repeats)
+            self._last_repeat_frac_mean = sum(batch_num_repeats) / sum(batch_total_tokens) if sum(batch_total_tokens) > 0 else 0.0
+        else:
+            self._last_rep_rate_mean = 0.0
+            self._last_rep_rate_max = 0.0
+            self._last_num_repeats_mean = 0.0
+            self._last_repeat_frac_mean = 0.0
+        
+        # Add repetition penalty to base reward BEFORE normalization (matches RNN controller)
+        if rep_c != 0.0:
+            per_token_base_reward = per_token_base_reward + rep_penalty_tensor
+            
+            # Compute total repetition penalty per sample (for wandb logging)
+            # Sum over sequence dimension, then mean over batch
+            rep_penalty_sum_per_sample = rep_penalty_tensor.sum(dim=1)  # [batch]
+            self._last_rep_penalty_sum_mean = rep_penalty_sum_per_sample.mean().item()
+            
+            if self.accelerator.is_main_process:
+                nonzero_penalty = rep_penalty_tensor[rep_penalty_tensor != 0]
+                if nonzero_penalty.numel() > 0:
+                    self._last_rep_penalty_mean = nonzero_penalty.mean().item()
+                    print(f"  [OC-FWD] Repetition penalty (c={rep_c}, λ={rep_decay}): "
+                          f"num_penalized={nonzero_penalty.numel()}, "
+                          f"mean={nonzero_penalty.mean().item():.6f}, "
+                          f"min={nonzero_penalty.min().item():.6f}, max={nonzero_penalty.max().item():.6f}", flush=True)
+                else:
+                    self._last_rep_penalty_mean = 0.0
+                    print(f"  [OC-FWD] Repetition penalty (c={rep_c}, λ={rep_decay}): no repeats found", flush=True)
+        else:
+            self._last_rep_penalty_mean = 0.0
+            self._last_rep_penalty_sum_mean = 0.0
+        
+        # Normalize rewards by a CONSTANT for numerical stability AFTER adding all components
+        # (matches RNN controller order: KL reward + repetition penalty, THEN normalize)
+        # We use a fixed constant (512) instead of actual response length so that
+        # per-token rewards don't depend on how many other tokens are in the sequence.
+        # This keeps hyperparameters calibrated while fixing the length bias issue.
+        REWARD_NORMALIZATION_CONSTANT = 512.0
+        per_token_base_reward = per_token_base_reward / REWARD_NORMALIZATION_CONSTANT
+        
+        if self.accelerator.is_main_process:
+            print(f"  [OC-FWD] per_token_base_reward (normalized by {REWARD_NORMALIZATION_CONSTANT}): min={per_token_base_reward.min().item():.4f}, max={per_token_base_reward.max().item():.4f}", flush=True)
+        
+        if self.accelerator.is_main_process:
+            print(f"  [OC-FWD] Repetition metrics: rep_rate_mean={self._last_rep_rate_mean:.4f}, "
+                  f"rep_rate_max={self._last_rep_rate_max:.4f}, "
+                  f"num_repeats_mean={self._last_num_repeats_mean:.1f}, "
+                  f"repeat_frac={self._last_repeat_frac_mean:.4f}", flush=True)
         
         # Valid mask: positions within [left_padding, query_len + response_length)
         # Compute attention mask for query (1 for real tokens, 0 for padding)
@@ -838,12 +1830,53 @@ class ActivationControllerTrainer:
         # Get terminated flags
         terminated = rollout.terminated if rollout.terminated is not None else torch.zeros(batch_size, dtype=torch.bool, device=device)
         
-        # Process each layer
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Process each layer (matches RNN controller pattern)
+        # Accumulate: policy_loss (scalars summed), value_loss ([batch] tensors summed)
+        total_policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_value_loss = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        total_expert_entropy = torch.tensor(0.0, device=device, requires_grad=True)
+        num_valid_timesteps = 0
+        num_switch_timesteps = 0
+        num_layers_with_entropy = 0
         layer_metrics = {}
+        
+        # For intra-option policy update
+        intra_option_advantages = {}  # layer_idx -> [batch, seq_len]
+        intra_option_q_values = {}  # layer_idx -> [batch, seq_len] (for optional Q baseline)
+        valid_masks_per_layer = {}  # layer_idx -> [batch, seq_len]
         
         gamma = self.config.gamma
         deliberation_cost = self.config.option_critic_deliberation_cost
+        
+        # =========================================================================
+        # Create full-sequence importance weights for off-policy correction
+        # rollout.importance_weights: [batch, response_len] from teacher-mixed sampling
+        # We expand to [batch, seq_len] with query positions having weight=1.0
+        # =========================================================================
+        full_seq_importance_weights = None
+        if rollout.importance_weights is not None:
+            iw_response = rollout.importance_weights  # [batch, response_len]
+            full_seq_importance_weights = torch.ones(batch_size, seq_len, device=device, dtype=torch.float32)
+            
+            # Place response importance weights at response positions
+            # Response starts at query_len in the full sequence
+            iw_response_len = iw_response.shape[1]
+            available_space = seq_len - query_len
+            actual_iw_len = min(iw_response_len, available_space)
+            
+            if actual_iw_len > 0:
+                full_seq_importance_weights[:, query_len:query_len + actual_iw_len] = iw_response[:, :actual_iw_len].to(device)
+            
+            if self.accelerator.is_main_process:
+                valid_iw = full_seq_importance_weights[valid_mask]
+                print(f"  [OC-FWD] Importance weights for controller: mean={valid_iw.mean().item():.4f}, "
+                      f"std={valid_iw.std().item() if valid_iw.numel() > 1 else 0:.4f}", flush=True)
+        
+        if self.accelerator.is_main_process:
+            num_experts = first_layer_data["router_logits"].shape[-1]
+            print(f"  [OC-FWD] batch_size={batch_size}, num_layers={len(self.activation_controllers)}, num_experts={num_experts}", flush=True)
+            print(f"  [OC-FWD] gamma={gamma}, deliberation_cost={deliberation_cost}", flush=True)
+            print(f"  [OC-FWD] valid_mask: {valid_mask.sum().item()} / {valid_mask.numel()} ({100*valid_mask.sum().item()/valid_mask.numel():.1f}%)", flush=True)
         
         for layer_idx, ctrl in self.activation_controllers.items():
             layer_data = rollout.layer_data.get(layer_idx)
@@ -885,18 +1918,133 @@ class ActivationControllerTrainer:
                 valid_mask=valid_mask,
                 valid_end=valid_end,
                 terminated=terminated,
+                importance_weights=full_seq_importance_weights,
             )
             
-            total_loss = total_loss + layer_result["loss"]
+            # Accumulate losses (matches RNN controller)
+            total_policy_loss = total_policy_loss + layer_result["policy_loss"]
+            total_value_loss = total_value_loss + layer_result["value_loss"]
+            num_valid_timesteps += layer_result["num_valid_timesteps"]
+            num_switch_timesteps += layer_result["num_switch_timesteps"]
+            
+            # Accumulate expert entropy (keep gradients for entropy bonus)
+            if "expert_entropy" in layer_result:
+                total_expert_entropy = total_expert_entropy + layer_result["expert_entropy"]
+                num_layers_with_entropy += 1
+            
             layer_metrics[layer_idx] = layer_result
+            
+            # Collect intra-option advantages for LLM update
+            if "intra_option_advantage" in layer_result:
+                intra_option_advantages[layer_idx] = layer_result["intra_option_advantage"]
+            if "intra_option_q_values" in layer_result:
+                intra_option_q_values[layer_idx] = layer_result["intra_option_q_values"]
+            if "valid_mask" in layer_result:
+                valid_masks_per_layer[layer_idx] = layer_result["valid_mask"]
+            
+            # Collect switch probabilities for TopK regularization
+            if "switch_probs" in layer_result and "t_mask" in layer_result:
+                if not hasattr(self, '_all_switch_probs'):
+                    self._all_switch_probs = []
+                sp = layer_result["switch_probs"]  # [batch, seq_len]
+                vm = layer_result["valid_mask"]    # [batch, seq_len]
+                tm = layer_result["t_mask"]        # [batch, seq_len]
+                valid_sp = sp[vm & tm]  # Flatten to 1D, valid positions only
+                self._all_switch_probs.append(valid_sp)
+        
+        # =========================================================================
+        # TopK termination regularization loss
+        # Loss = λ * (1 - mean(TopK β))²
+        # Prevents termination head from collapsing to uniform-low
+        # =========================================================================
+        term_topk_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        self._last_term_topk_mean = 0.0
+        self._last_term_topk_loss = 0.0
+        if self.config.term_topk_lambda > 0 and hasattr(self, '_all_switch_probs') and self._all_switch_probs:
+            # Concatenate all switch probs from all layers
+            all_sp = torch.cat(self._all_switch_probs, dim=0)
+            
+            # Get top K
+            K = min(self.config.term_topk_k, all_sp.numel())
+            if K > 0:
+                topk_sp, _ = torch.topk(all_sp, K)
+                # Loss = λ * mean((1 - β_i)² for i in topK)
+                # This pushes EACH of the top K towards 1, not just their average
+                term_topk_loss = self.config.term_topk_lambda * ((1.0 - topk_sp) ** 2).mean()
+                
+                # Store for wandb logging
+                self._last_term_topk_mean = topk_sp.mean().item()
+                self._last_term_topk_loss = term_topk_loss.item()
+                
+                if self.accelerator.is_main_process:
+                    print(f"  [OC-FWD] TopK term reg: K={K}, mean_topk={topk_sp.mean().item():.4f}, "
+                          f"loss={term_topk_loss.item():.6f}", flush=True)
+            
+            # Clear for next forward pass
+            self._all_switch_probs = []
+        
+        # Add TopK loss to policy loss (matches RNN controller)
+        total_policy_loss = total_policy_loss + term_topk_loss
+        
+        # Normalize policy loss by number of layers (matches RNN controller)
+        num_layers = len(layer_metrics)
+        total_policy_loss = total_policy_loss / max(num_layers, 1)
+        
+        # Compute mean expert entropy (as tensor for gradient flow)
+        mean_expert_entropy = total_expert_entropy / max(num_layers_with_entropy, 1)
+        
+        # Value loss: sum across batch, then normalize by num_decisions
+        # (matches RNN controller pattern in compute_loss)
+        value_loss_sum = total_value_loss.sum()
+        mean_value_loss = value_loss_sum / max(num_valid_timesteps, 1)
+        
+        # Entropy bonus: -entropy_coef * entropy
+        entropy_coef = getattr(self.config, 'entropy_coef', 0.0)
+        entropy_bonus = -entropy_coef * mean_expert_entropy
+        
+        # Total loss = policy + value_coef * value + entropy_bonus
+        # (matches RNN controller compute_loss)
+        total_loss = total_policy_loss + self.config.value_coef * mean_value_loss + entropy_bonus
         
         # Scale loss for gradient accumulation
         scaled_loss = total_loss * scale_factor
         
-        # Aggregate metrics
-        avg_policy_loss = sum(m["policy_loss"] for m in layer_metrics.values()) / max(len(layer_metrics), 1)
-        avg_value_loss = sum(m["value_loss"] for m in layer_metrics.values()) / max(len(layer_metrics), 1)
+        # Aggregate metrics for logging
+        avg_policy_loss = total_policy_loss.item()
+        avg_value_loss = mean_value_loss.item()
         avg_switch_rate = sum(m["switch_rate"] for m in layer_metrics.values()) / max(len(layer_metrics), 1)
+        
+        # Store entropy for wandb logging
+        self._last_expert_entropy = mean_expert_entropy.item()
+        
+        # Aggregate termination binariness metrics
+        if num_layers > 0 and "switch_prob_mean" in next(iter(layer_metrics.values())):
+            avg_switch_prob_mean = sum(m["switch_prob_mean"] for m in layer_metrics.values()) / num_layers
+            avg_switch_prob_std = sum(m["switch_prob_std"] for m in layer_metrics.values()) / num_layers
+            avg_switch_binary_frac = sum(m["switch_binary_frac"] for m in layer_metrics.values()) / num_layers
+            avg_switch_entropy = sum(m["switch_entropy"] for m in layer_metrics.values()) / num_layers
+            max_switch_prob_max = max(m["switch_prob_max"] for m in layer_metrics.values())
+            max_switch_prob_p90 = max(m["switch_prob_p90"] for m in layer_metrics.values())
+            max_switch_prob_p95 = max(m["switch_prob_p95"] for m in layer_metrics.values())
+            avg_frac_gt_0p1 = sum(m["frac_gt_0p1"] for m in layer_metrics.values()) / num_layers
+            avg_frac_gt_0p5 = sum(m["frac_gt_0p5"] for m in layer_metrics.values()) / num_layers
+        else:
+            avg_switch_prob_mean = 0.0
+            avg_switch_prob_std = 0.0
+            avg_switch_binary_frac = 0.0
+            avg_switch_entropy = 0.0
+            max_switch_prob_max = 0.0
+            max_switch_prob_p90 = 0.0
+            max_switch_prob_p95 = 0.0
+            avg_frac_gt_0p1 = 0.0
+            avg_frac_gt_0p5 = 0.0
+        
+        # Summary print (matches RNN controller)
+        if self.accelerator.is_main_process:
+            switch_rate = num_switch_timesteps / max(num_valid_timesteps, 1)
+            print(f"  [OC-FWD] num_valid_timesteps={num_valid_timesteps}, num_switch_timesteps={num_switch_timesteps} ({switch_rate:.2%})", flush=True)
+            print(f"  [OC-FWD] total_policy_loss={avg_policy_loss:.4f}, mean_value_loss={avg_value_loss:.4f}", flush=True)
+            print(f"  [OC-FWD] expert_entropy={self._last_expert_entropy:.4f} (max={math.log(num_experts):.2f})", flush=True)
         
         return {
             "loss": scaled_loss,  # Tensor for backward
@@ -905,17 +2053,336 @@ class ActivationControllerTrainer:
             "value_loss": avg_value_loss,
             "switch_rate": avg_switch_rate,
             "layer_metrics": layer_metrics,
+            # For intra-option policy update
+            "intra_option_advantages": intra_option_advantages,
+            "intra_option_q_values": intra_option_q_values,
+            "valid_masks_per_layer": valid_masks_per_layer,
+            # Termination binariness metrics
+            "switch_prob_mean": avg_switch_prob_mean,
+            "switch_prob_std": avg_switch_prob_std,
+            "switch_binary_frac": avg_switch_binary_frac,
+            "switch_entropy": avg_switch_entropy,
+            "switch_prob_max": max_switch_prob_max,
+            "switch_prob_p90": max_switch_prob_p90,
+            "switch_prob_p95": max_switch_prob_p95,
+            "frac_gt_0p1": avg_frac_gt_0p1,
+            "frac_gt_0p5": avg_frac_gt_0p5,
         }
+    
+    # =========================================================================
+    # Intra-Option Policy Update (Harb et al. 2017, Algorithm 1)
+    # =========================================================================
+    
+    def _compute_intra_option_loss(
+        self,
+        rollout: ControllerRollout,
+        intra_option_advantages: Dict[int, torch.Tensor],  # layer_idx -> [batch, seq_len]
+        valid_masks: Dict[int, torch.Tensor],  # layer_idx -> [batch, seq_len]
+        intra_option_q_values: Optional[Dict[int, torch.Tensor]] = None,  # layer_idx -> [batch, seq_len]
+    ) -> torch.Tensor:
+        """
+        Compute intra-option policy gradient loss (Harb et al. 2017, Algorithm 1).
+        
+        This does a forward pass through the LLM with the recorded expert selections
+        (via replay_actions), computes token log probabilities, and applies the
+        intra-option advantage.
+        
+        When intra_option_q_baseline is enabled, uses G - Q(s,o) as the advantage
+        (matching A2OC Algorithm 1). Otherwise uses raw G (on-policy distillation style).
+        
+        Loss: -sum(A_t * log P(token_t | context)) / num_valid_tokens
+        
+        Args:
+            rollout: ControllerRollout with recorded actions
+            intra_option_advantages: Per-layer discounted returns G [batch, seq_len]
+            valid_masks: Per-layer validity masks
+            intra_option_q_values: Per-layer Q(s,o) values for optional baseline subtraction
+            
+        Returns:
+            Intra-option policy loss (scalar tensor with gradients)
+        """
+        device = rollout.queries.device
+        
+        # Concatenate queries and responses for the forward pass
+        input_ids = torch.cat([rollout.queries, rollout.responses], dim=1)
+        batch_size, total_len = input_ids.shape
+        query_len = rollout.queries.shape[1]
+        response_len = rollout.responses.shape[1]
+        
+        # Create attention mask (1 for real tokens, 0 for padding)
+        attention_mask = (input_ids != rollout.pad_token_id).long()
+        
+        # Build replay_actions from rollout.layer_data
+        # This tells the model to use the recorded expert selections instead of sampling
+        replay_actions = {}
+        for layer_idx, layer_data in rollout.layer_data.items():
+            recorded_seq_len = layer_data["switches"].shape[1]
+            
+            # Debug: check for sequence length mismatch
+            if self.accelerator.is_main_process and layer_idx == 0:
+                print(f"  [INTRA-OPT-DEBUG] total_len={total_len}, recorded_seq_len={recorded_seq_len}, query_len={query_len}, response_len={response_len}", flush=True)
+            
+            # Pad replay actions if needed (in case of off-by-one from generation)
+            switches = layer_data["switches"]
+            selected_indices = layer_data["selected_indices"]
+            
+            if recorded_seq_len < total_len:
+                # Pad with zeros (no switch) to avoid index error
+                pad_size = total_len - recorded_seq_len
+                # switches is bool tensor - pad with False (no switch for padded positions)
+                switches = F.pad(switches.float(), (0, pad_size), value=0.0).bool()
+                selected_indices = F.pad(selected_indices, (0, 0, 0, pad_size), value=0)
+                if self.accelerator.is_main_process and layer_idx == 0:
+                    print(f"  [INTRA-OPT-DEBUG] Padded replay actions from {recorded_seq_len} to {total_len}", flush=True)
+            
+            replay_actions[layer_idx] = {
+                "switches": switches,  # [batch, seq_len]
+                "selected_indices": selected_indices,  # [batch, seq_len, k]
+            }
+        
+        # Set up controller runtime for replay
+        controller_runtime = {
+            "sampling": False,
+            "replay_actions": replay_actions,
+        }
+        
+        # Get the unwrapped model for forward pass
+        model = self.model
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        policy = model
+        if hasattr(policy, 'policy'):
+            policy = policy.policy
+        
+        # Ensure model is in training mode for gradient tracking
+        policy.train()
+        
+        # DEBUG: Check trainable params in the model we're using
+        if self.accelerator.is_main_process:
+            trainable_count = sum(1 for p in policy.parameters() if p.requires_grad)
+            total_count = sum(1 for p in policy.parameters())
+            print(f"  [INTRA-OPT-DEBUG] policy type: {type(policy).__name__}, "
+                  f"trainable params: {trainable_count}/{total_count}", flush=True)
+        
+        # CRITICAL: Wrap forward pass with torch.enable_grad() to ensure gradient tracking
+        # even if we're in a no_grad context or gradient checkpointing is interfering
+        with torch.enable_grad():
+            # Forward pass with gradients (for LoRA + router)
+            # Note: We pass replay_actions so the model uses the same expert selections as during rollout
+            outputs = policy(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                controller_runtime=controller_runtime,
+                use_cache=False,
+            )
+            
+            # Get logits and compute token log probabilities
+            # outputs.logits: [batch, total_len, vocab_size]
+            # For causal LM, logits at position t predict token at position t+1
+            logits = outputs.logits  # [batch, total_len, vocab_size]
+        
+        if self.accelerator.is_main_process:
+            print(f"  [INTRA-OPT-GRAD] logits.requires_grad={logits.requires_grad}, "
+                  f"policy.training={policy.training}", flush=True)
+        
+        # Shift logits and labels for next-token prediction
+        # logits[:, :-1, :] predicts tokens at positions 1:total_len
+        shift_logits = logits[:, :-1, :].contiguous()  # [batch, total_len-1, vocab_size]
+        shift_labels = input_ids[:, 1:].contiguous()  # [batch, total_len-1]
+        
+        # Apply temperature scaling to match rollout sampling
+        # During rollout, tokens are sampled with temperature T, so log-probs should be
+        # computed under the same tempered distribution: log p_T(token) = logits/T - logsumexp(logits/T)
+        token_temperature = self.config.temperature
+        if token_temperature != 1.0:
+            shift_logits = shift_logits / token_temperature
+        
+        # Compute log probabilities of the actual tokens (under tempered distribution)
+        log_probs = F.log_softmax(shift_logits, dim=-1)  # [batch, total_len-1, vocab_size]
+        token_log_probs = log_probs.gather(
+            dim=-1, index=shift_labels.unsqueeze(-1)
+        ).squeeze(-1)  # [batch, total_len-1]
+        
+        # The response tokens start at position query_len-1 in shift_labels
+        # (because shift_labels starts at position 1 of input_ids)
+        # Response positions in shift_labels: [query_len-1, query_len-1+response_len)
+        response_start_idx = query_len - 1
+        response_token_log_probs = token_log_probs[:, response_start_idx:response_start_idx + response_len]
+        # [batch, response_len]
+        
+        # Aggregate intra-option advantages across all layers
+        # When intra_option_q_baseline is enabled, use G - Q(s,o) (A2OC Algorithm 1)
+        # Otherwise use raw G (on-policy distillation style)
+        use_q_baseline = getattr(self.config, 'intra_option_q_baseline', False) and intra_option_q_values
+        total_advantage = None
+        total_valid_mask = None
+        num_layers = 0
+        
+        # Determine available response length from first layer's advantage
+        first_layer_idx = next(iter(intra_option_advantages.keys()))
+        first_advantage = intra_option_advantages[first_layer_idx]
+        adv_seq_len = first_advantage.shape[1]
+        # Advantages start at query_len - 1 (the first prediction position for response tokens)
+        adv_start = query_len - 1
+        # Mask starts at query_len (the target token positions)
+        mask_start = query_len
+        # available_response_len must account for BOTH advantage and mask slicing
+        adv_available = adv_seq_len - adv_start if adv_seq_len > adv_start else 0
+        mask_available = adv_seq_len - mask_start if adv_seq_len > mask_start else 0
+        available_response_len = min(adv_available, mask_available, response_len)
+        
+        if available_response_len <= 0:
+            if self.accelerator.is_main_process:
+                print(f"  [INTRA-OPT-SHAPE] No response tokens with advantages (adv_seq_len={adv_seq_len}, query_len={query_len})", flush=True)
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Slice response_token_log_probs to match available_response_len
+        assert response_token_log_probs.shape[1] >= available_response_len, \
+            f"Not enough tokens: response_token_log_probs has {response_token_log_probs.shape[1]} but need {available_response_len}"
+        response_token_log_probs = response_token_log_probs[:, :available_response_len]
+        
+        if self.accelerator.is_main_process:
+            print(f"  [INTRA-OPT-SHAPE] query_len={query_len}, response_len={response_len}, "
+                  f"available_response_len={available_response_len}, "
+                  f"response_token_log_probs.shape={response_token_log_probs.shape}", flush=True)
+        
+        for layer_idx, advantage in intra_option_advantages.items():
+            valid_mask = valid_masks[layer_idx]
+            
+            if self.accelerator.is_main_process and layer_idx == 0:
+                print(f"  [INTRA-OPT-SHAPE] Layer {layer_idx}: advantage.shape={advantage.shape}, "
+                      f"valid_mask.shape={valid_mask.shape}, adv_start={adv_start}", flush=True)
+            
+            adv_seq_len = advantage.shape[1]
+            adv_start = query_len - 1
+            
+            # Calculate how many response tokens we can use
+            layer_adv_available = adv_seq_len - adv_start if adv_seq_len > adv_start else 0
+            layer_mask_available = adv_seq_len - mask_start if adv_seq_len > mask_start else 0
+            layer_available_len = min(layer_adv_available, layer_mask_available, response_len)
+            
+            if layer_available_len <= 0:
+                if self.accelerator.is_main_process and layer_idx == 0:
+                    print(f"  [INTRA-OPT-SHAPE] Skipping layer {layer_idx}: no response tokens with advantages", flush=True)
+                continue
+            
+            # Assert bounds before slicing
+            assert adv_start + available_response_len <= advantage.shape[1], \
+                f"Layer {layer_idx}: advantage slice out of bounds"
+            assert mask_start + available_response_len <= valid_mask.shape[1], \
+                f"Layer {layer_idx}: valid_mask slice out of bounds"
+            
+            adv_response = advantage[:, adv_start:adv_start + available_response_len]
+            mask_response = valid_mask[:, mask_start:mask_start + available_response_len]
+            
+            # Subtract Q baseline if enabled (A2OC: advantage = G - Q(s,o))
+            if use_q_baseline and layer_idx in intra_option_q_values:
+                q_response = intra_option_q_values[layer_idx][:, adv_start:adv_start + available_response_len]
+                adv_response = adv_response - q_response
+            
+            # Verify shapes after slicing
+            assert adv_response.shape == response_token_log_probs.shape, \
+                f"Layer {layer_idx}: adv_response {adv_response.shape} != response_token_log_probs {response_token_log_probs.shape}"
+            assert mask_response.shape == response_token_log_probs.shape, \
+                f"Layer {layer_idx}: mask_response {mask_response.shape} != response_token_log_probs {response_token_log_probs.shape}"
+            
+            if total_advantage is None:
+                total_advantage = adv_response.clone()
+                total_valid_mask = mask_response.clone()
+            else:
+                total_advantage = total_advantage + adv_response
+                total_valid_mask = total_valid_mask & mask_response
+            
+            num_layers += 1
+        
+        if total_advantage is None or num_layers == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Average advantage across layers
+        avg_advantage = total_advantage / num_layers  # [batch, available_response_len]
+        
+        # Shape assertions
+        assert avg_advantage.shape == response_token_log_probs.shape
+        assert total_valid_mask.shape == response_token_log_probs.shape
+        
+        # Normalize advantage (standard practice for policy gradients)
+        valid_advs = avg_advantage[total_valid_mask]
+        if valid_advs.numel() > 1:
+            adv_mean = valid_advs.mean()
+            adv_std = valid_advs.std().clamp(min=1e-8)
+            normalized_advantage = (avg_advantage - adv_mean) / adv_std
+        elif valid_advs.numel() == 1:
+            normalized_advantage = avg_advantage
+        else:
+            if self.accelerator.is_main_process:
+                print(f"  [INTRA-OPTION] WARNING: No valid tokens for intra-option loss", flush=True)
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # =========================================================================
+        # Apply importance weights for teacher-mixed sampling (MiniLLM)
+        # When teacher_mix_alpha > 0, tokens are sampled from mixed distribution:
+        # p_mixed = α * p_teacher + (1-α) * p_student
+        # Importance weight w_t = p_student(token_t) / p_mixed(token_t)
+        # This corrects for the off-policy sampling
+        # Reference: https://arxiv.org/pdf/2306.08543 (Section 2.2)
+        # =========================================================================
+        importance_weights = None
+        if rollout.importance_weights is not None:
+            # Slice importance weights to match available_response_len
+            iw = rollout.importance_weights[:, :available_response_len]
+            if iw.shape == response_token_log_probs.shape:
+                importance_weights = iw
+                if self.accelerator.is_main_process:
+                    valid_iw = importance_weights[total_valid_mask]
+                    print(f"  [INTRA-OPTION] Applying importance weights: mean={valid_iw.mean().item():.4f}, "
+                          f"std={valid_iw.std().item() if valid_iw.numel() > 1 else 0:.4f}", flush=True)
+            else:
+                if self.accelerator.is_main_process:
+                    print(f"  [INTRA-OPTION] Warning: importance_weights shape {iw.shape} != "
+                          f"response_token_log_probs shape {response_token_log_probs.shape}, skipping", flush=True)
+        
+        # Compute intra-option policy loss: -w * A * log_prob (sum over valid tokens)
+        # With importance weights: loss = sum(-w_t * A_t * log_prob_t) / sum(w_t)
+        # Without: loss = sum(-A_t * log_prob_t) / num_valid
+        if importance_weights is not None:
+            weighted_loss = torch.where(
+                total_valid_mask,
+                -importance_weights * normalized_advantage * response_token_log_probs,
+                torch.zeros_like(response_token_log_probs)
+            )
+            # Normalize by sum of weights for valid tokens
+            weight_sum = (importance_weights * total_valid_mask.float()).sum().clamp(min=1e-8)
+            intra_option_loss = weighted_loss.sum() / weight_sum
+        else:
+            masked_loss = torch.where(
+                total_valid_mask,
+                -normalized_advantage * response_token_log_probs,
+                torch.zeros_like(response_token_log_probs)
+            )
+            num_valid_tokens = total_valid_mask.sum().clamp(min=1)
+            intra_option_loss = masked_loss.sum() / num_valid_tokens
+        
+        if self.accelerator.is_main_process:
+            baseline_str = "G - Q" if use_q_baseline else "G"
+            iw_str = f", importance_weighted=True" if importance_weights is not None else ""
+            print(f"  [INTRA-OPTION] Loss: {intra_option_loss.item():.6f}, "
+                  f"avg_adv ({baseline_str}): mean={valid_advs.mean().item():.4f}, std={valid_advs.std().item() if valid_advs.numel() > 1 else 0:.4f}, "
+                  f"token_temp: {token_temperature}{iw_str}", flush=True)
+        
+        return intra_option_loss
     
     def train_step_with_accumulation(
         self,
         batch_queries: List[torch.Tensor],
+        batch_ground_truth_answers: Optional[List[Optional[List[str]]]] = None,
     ) -> Dict[str, float]:
         """
         Training step with gradient accumulation (matches original ControllerTrainer).
         
         Args:
             batch_queries: List of [batch, query_len] tensors, one per accumulation step
+            batch_ground_truth_answers: Optional list of ground truth answer lists, one per accum step
             
         Returns:
             Dict with metrics
@@ -949,8 +2416,13 @@ class ActivationControllerTrainer:
             if self.accelerator.is_main_process:
                 print(f"  [ROLLOUT {accum_idx+1}/{grad_accum_steps}] Generating rollout...", flush=True)
             
+            # Get ground truth answers for this accumulation step if available
+            accum_answers = None
+            if batch_ground_truth_answers is not None and accum_idx < len(batch_ground_truth_answers):
+                accum_answers = batch_ground_truth_answers[accum_idx]
+            
             with torch.no_grad():
-                rollout = self.generate_rollout(queries)
+                rollout = self.generate_rollout(queries, ground_truth_answers=accum_answers)
             
             rollouts.append(rollout)
             all_local_rewards.append(rollout.rewards)
@@ -958,6 +2430,17 @@ class ActivationControllerTrainer:
             all_response_lengths.append(rollout.response_lengths)
         
         rollout_time = time.time() - rollout_start
+        
+        # Accumulate correctness stats across rollouts
+        total_correct = 0
+        total_with_answers = 0
+        for rollout in rollouts:
+            if rollout.correctness is not None:
+                total_correct += rollout.correctness.sum().item()
+                total_with_answers += rollout.correctness.numel()
+        self._last_correctness_rate = total_correct / max(total_with_answers, 1)
+        self._last_correctness_count = total_correct
+        self._last_correctness_total = total_with_answers
         
         # Concatenate for logging
         local_rewards = torch.cat(all_local_rewards, dim=0)
@@ -987,6 +2470,8 @@ class ActivationControllerTrainer:
             
             # Zero gradients at start of each epoch
             self.optimizer.zero_grad()
+            if self.llm_optimizer is not None:
+                self.llm_optimizer.zero_grad()
             
             for accum_idx, rollout in enumerate(rollouts):
                 # Compute loss (scaled for accumulation)
@@ -1005,12 +2490,71 @@ class ActivationControllerTrainer:
                 # Backward - accumulate gradients
                 result["loss"].backward()
                 
+                # =========================================================
+                # Intra-option policy update on LLM (Harb et al. 2017, Algorithm 1)
+                # This is a SEPARATE backward pass for LoRA + router parameters
+                # =========================================================
+                intra_option_advantages = result.get("intra_option_advantages", {})
+                intra_option_q_vals = result.get("intra_option_q_values", {})
+                valid_masks_per_layer = result.get("valid_masks_per_layer", {})
+                
+                # Skip intra-option updates during warmup period (let value function warm up first)
+                in_warmup = self.global_step <= self.config.intra_option_warmup_steps
+                if self.lora_enabled and intra_option_advantages and self.llm_optimizer is not None and not in_warmup:
+                    intra_option_loss = self._compute_intra_option_loss(
+                        rollout, intra_option_advantages, valid_masks_per_layer,
+                        intra_option_q_values=intra_option_q_vals,
+                    )
+                    # Scale by same factor as controller loss for gradient accumulation
+                    scaled_intra_loss = intra_option_loss * scale_factor
+                    scaled_intra_loss.backward()
+                    
+                    if self.accelerator.is_main_process and epoch_idx == 0 and accum_idx == 0:
+                        print(f"  [INTRA-OPTION] Backward pass completed, loss={intra_option_loss.item():.6f}", flush=True)
+                        
+                        # Check LoRA and router gradients
+                        lora_grad_norms = []
+                        router_grad_norms = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None:
+                                grad_norm = param.grad.norm().item()
+                                if 'lora_' in name:
+                                    lora_grad_norms.append(grad_norm)
+                                elif 'router' in name:
+                                    router_grad_norms.append(grad_norm)
+                        
+                        if lora_grad_norms:
+                            avg_lora = sum(lora_grad_norms) / len(lora_grad_norms)
+                            print(f"  [GRAD-CHECK] LoRA params with grads: {len(lora_grad_norms)}, avg grad norm: {avg_lora:.6f}", flush=True)
+                        else:
+                            print(f"  [GRAD-CHECK] WARNING: No LoRA params have gradients!", flush=True)
+                        
+                        if router_grad_norms:
+                            avg_router = sum(router_grad_norms) / len(router_grad_norms)
+                            print(f"  [GRAD-CHECK] Router params with grads: {len(router_grad_norms)}, avg grad norm: {avg_router:.6f}", flush=True)
+                        else:
+                            print(f"  [GRAD-CHECK] WARNING: No router params have gradients!", flush=True)
+                elif in_warmup and self.lora_enabled and self.accelerator.is_main_process and epoch_idx == 0 and accum_idx == 0:
+                    print(f"  [INTRA-OPTION] Skipping LLM update (warmup: step {self.global_step}/{self.config.intra_option_warmup_steps})", flush=True)
+                
                 # Accumulate metrics (only on first epoch)
                 if epoch_idx == 0:
                     total_loss += result["loss_value"]
                     total_policy_loss += result["policy_loss"]
                     total_value_loss += result["value_loss"]
                     total_switch_rate += result["switch_rate"]
+                    
+                    # Store termination binariness metrics from last rollout (for logging)
+                    if "switch_prob_mean" in result:
+                        self._last_switch_prob_mean = result["switch_prob_mean"]
+                        self._last_switch_prob_std = result["switch_prob_std"]
+                        self._last_switch_binary_frac = result["switch_binary_frac"]
+                        self._last_switch_entropy = result["switch_entropy"]
+                        self._last_switch_prob_max = result["switch_prob_max"]
+                        self._last_switch_prob_p90 = result["switch_prob_p90"]
+                        self._last_switch_prob_p95 = result["switch_prob_p95"]
+                        self._last_frac_gt_0p1 = result["frac_gt_0p1"]
+                        self._last_frac_gt_0p5 = result["frac_gt_0p5"]
             
             # =========================================================
             # Sync gradients across all GPUs before optimizer step
@@ -1043,6 +2587,98 @@ class ActivationControllerTrainer:
             
             # Optimizer step (after all accumulation steps)
             self.optimizer.step()
+            
+            # LLM optimizer step (for intra-option policy update)
+            # Skip during warmup (same as skipping the backward pass)
+            in_warmup_for_llm = self.global_step <= self.config.intra_option_warmup_steps
+            if self.llm_optimizer is not None and not in_warmup_for_llm:
+                # Sync LLM gradients across GPUs
+                if torch.distributed.is_initialized():
+                    llm_params = self._get_llm_trainable_params()
+                    for p in llm_params:
+                        if p.grad is not None:
+                            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+                
+                # Gradient clipping for LLM
+                if self.config.max_grad_norm is not None:
+                    llm_params = self._get_llm_trainable_params()
+                    torch.nn.utils.clip_grad_norm_(llm_params, self.config.max_grad_norm)
+                
+                # Record param norms BEFORE optimizer step
+                lora_norms_before = []
+                router_norms_before = []
+                if self.accelerator.is_main_process and epoch_idx == 0:
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad:
+                            param_norm = param.data.norm().item()
+                            if 'lora_' in name:
+                                lora_norms_before.append(param_norm)
+                            elif 'router' in name:
+                                router_norms_before.append(param_norm)
+                
+                # DEBUG: Check if optimizer's params have gradients before step
+                if self.accelerator.is_main_process and epoch_idx == 0:
+                    # Get all params from optimizer
+                    opt_param_ids = set()
+                    for group in self.llm_optimizer.param_groups:
+                        for p in group['params']:
+                            opt_param_ids.add(id(p))
+                    
+                    # Get all params from model that have gradients
+                    model_params_with_grad = {}
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            model_params_with_grad[id(param)] = (name, param.grad.norm().item())
+                    
+                    # Check overlap
+                    opt_params_with_grad = 0
+                    opt_params_no_grad = 0
+                    model_grads_not_in_opt = 0
+                    
+                    for group in self.llm_optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is not None:
+                                opt_params_with_grad += 1
+                            else:
+                                opt_params_no_grad += 1
+                    
+                    for pid in model_params_with_grad:
+                        if pid not in opt_param_ids:
+                            name, grad_norm = model_params_with_grad[pid]
+                            if 'controller' not in name:  # Exclude controller params
+                                model_grads_not_in_opt += 1
+                    
+                    total_opt_params = sum(len(g['params']) for g in self.llm_optimizer.param_groups)
+                    print(f"  [OPT-DEBUG] Optimizer: {opt_params_with_grad} have grad, {opt_params_no_grad} no grad, total={total_opt_params}", flush=True)
+                    print(f"  [OPT-DEBUG] Model params with grad NOT in optimizer: {model_grads_not_in_opt}", flush=True)
+                
+                self.llm_optimizer.step()
+                self.llm_optimizer.zero_grad()
+                
+                # Record param norms AFTER optimizer step and compute delta
+                if self.accelerator.is_main_process and epoch_idx == 0:
+                    lora_norms_after = []
+                    router_norms_after = []
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad:
+                            param_norm = param.data.norm().item()
+                            if 'lora_' in name:
+                                lora_norms_after.append(param_norm)
+                            elif 'router' in name:
+                                router_norms_after.append(param_norm)
+                    
+                    if lora_norms_before and lora_norms_after:
+                        avg_before = sum(lora_norms_before) / len(lora_norms_before)
+                        avg_after = sum(lora_norms_after) / len(lora_norms_after)
+                        delta = avg_after - avg_before
+                        print(f"  [LLM-UPDATE] LoRA: before={avg_before:.8f}, after={avg_after:.8f}, delta={delta:.6e}", flush=True)
+                    if router_norms_before and router_norms_after:
+                        avg_before = sum(router_norms_before) / len(router_norms_before)
+                        avg_after = sum(router_norms_after) / len(router_norms_after)
+                        delta = avg_after - avg_before
+                        max_delta = max(abs(a - b) for a, b in zip(router_norms_after, router_norms_before))
+                        print(f"  [LLM-UPDATE] Router: before={avg_before:.8f}, after={avg_after:.8f}, delta={delta:.6e}, max_delta={max_delta:.6e}", flush=True)
+                    print(f"  [LLM-UPDATE] LLM optimizer step completed", flush=True)
             
             # Clamp switch biases to prevent collapse
             min_switch_bias = -10.0
@@ -1092,6 +2728,18 @@ class ActivationControllerTrainer:
             "step_time": step_time,
             "gradient_accumulation_steps": grad_accum_steps,
         }
+        
+        # Add termination binariness metrics if available
+        if hasattr(self, '_last_switch_prob_mean'):
+            metrics["switch_prob_mean"] = self._last_switch_prob_mean
+            metrics["switch_prob_std"] = self._last_switch_prob_std
+            metrics["switch_binary_frac"] = self._last_switch_binary_frac
+            metrics["switch_entropy"] = self._last_switch_entropy
+            metrics["switch_prob_max"] = self._last_switch_prob_max
+            metrics["switch_prob_p90"] = self._last_switch_prob_p90
+            metrics["switch_prob_p95"] = self._last_switch_prob_p95
+            metrics["frac_gt_0p1"] = self._last_frac_gt_0p1
+            metrics["frac_gt_0p5"] = self._last_frac_gt_0p5
         
         return metrics
     
@@ -1148,25 +2796,35 @@ class ActivationControllerTrainer:
             
             # Collect batches for gradient accumulation
             batch_queries = []
+            batch_gt_answers = []
             
             for batch_idx, batch in enumerate(self.train_dataloader):
                 if isinstance(batch, dict):
                     queries = batch["input_ids"]
+                    gt_answers = batch.get("ground_truth_answers", None)
                 else:
                     queries = batch[0]
+                    gt_answers = None
                 
                 queries = queries.to(accelerator.device)
                 batch_queries.append(queries)
+                batch_gt_answers.append(gt_answers)
                 
                 # Check if we've collected enough batches for an optimizer step
                 if len(batch_queries) < grad_accum_steps:
                     continue
                 
                 # Training step with accumulation
-                metrics = self.train_step_with_accumulation(batch_queries)
+                # Pass ground truth answers if any batch has them
+                has_answers = any(a is not None for a in batch_gt_answers)
+                metrics = self.train_step_with_accumulation(
+                    batch_queries,
+                    batch_ground_truth_answers=batch_gt_answers if has_answers else None,
+                )
                 
                 # Clear the batch buffer
                 batch_queries = []
+                batch_gt_answers = []
                 
                 # Accumulate metrics for epoch-level logging
                 running_metrics["loss"] += metrics["loss"]
@@ -1212,21 +2870,62 @@ class ActivationControllerTrainer:
                         "timing/update_time": metrics["update_time"],
                         "progress/epoch": epoch,
                         "progress/global_step": self.global_step,
+                        "exploration/pl_epsilon": self._get_current_epsilon(),
+                        "exploration/q_epsilon": self._get_current_q_epsilon(),
                     }
-                    # Add reward-specific metrics if available
-                    if self.ppl_scorer is not None:
-                        if hasattr(self.ppl_scorer, 'last_batch_kl_mean'):
-                            # KLReward scorer
-                            log_dict["reward/kl_mean"] = self.ppl_scorer.last_batch_kl_mean
-                            log_dict["reward/kl_std"] = self.ppl_scorer.last_batch_kl_std
-                            log_dict["reward/teacher_ppl_mean"] = self.ppl_scorer.last_batch_teacher_ppl_mean
-                            log_dict["reward/student_ppl_mean"] = self.ppl_scorer.last_batch_student_ppl_mean
-                        elif hasattr(self.ppl_scorer, 'last_batch_log_ppl_mean'):
-                            # PerplexityReward scorer
-                            log_dict["reward/log_ppl_mean"] = self.ppl_scorer.last_batch_log_ppl_mean
-                            log_dict["reward/log_ppl_std"] = self.ppl_scorer.last_batch_log_ppl_std
-                            log_dict["reward/repetition_rate_mean"] = self.ppl_scorer.last_batch_repetition_rate_mean
-                            log_dict["reward/repetition_rate_std"] = self.ppl_scorer.last_batch_repetition_rate_std
+                    # Add KL reward metrics if available
+                    if self.ppl_scorer is not None and hasattr(self.ppl_scorer, 'last_batch_kl_mean'):
+                        log_dict["reward/kl_mean"] = self.ppl_scorer.last_batch_kl_mean
+                        log_dict["reward/kl_std"] = self.ppl_scorer.last_batch_kl_std
+                        log_dict["reward/teacher_ppl_mean"] = self.ppl_scorer.last_batch_teacher_ppl_mean
+                        log_dict["reward/student_ppl_mean"] = self.ppl_scorer.last_batch_student_ppl_mean
+                    
+                    # Add repetition metrics
+                    if hasattr(self, '_last_rep_rate_mean'):
+                        log_dict["repetition/rate_mean"] = self._last_rep_rate_mean
+                        log_dict["repetition/rate_max"] = self._last_rep_rate_max
+                        log_dict["repetition/num_repeats_mean"] = self._last_num_repeats_mean
+                        log_dict["repetition/repeat_frac"] = self._last_repeat_frac_mean
+                        log_dict["repetition/penalty_mean"] = self._last_rep_penalty_mean
+                        # Total repetition penalty per sample (sum over sequence, mean over batch)
+                        if hasattr(self, '_last_rep_penalty_sum_mean'):
+                            log_dict["repetition/penalty_sum_mean"] = self._last_rep_penalty_sum_mean
+                            # Reward with repetition penalty included
+                            # reward_mean is base_reward (per-token mean KL) - latency_penalty
+                            # rep_penalty_sum_mean is sum over sequence (before /512 normalization)
+                            # Divide by 512 to put on same per-token scale as reward_mean
+                            REWARD_NORMALIZATION_CONSTANT = 512.0
+                            rep_penalty_per_token = self._last_rep_penalty_sum_mean / REWARD_NORMALIZATION_CONSTANT
+                            log_dict["train/reward_with_rep_penalty"] = metrics["reward_mean"] + rep_penalty_per_token
+                    
+                    # Add TopK termination regularization metrics
+                    if hasattr(self, '_last_term_topk_mean'):
+                        log_dict["termination/topk_mean"] = self._last_term_topk_mean
+                        log_dict["termination/topk_loss"] = self._last_term_topk_loss
+                    
+                    # Add correctness metrics
+                    if hasattr(self, '_last_correctness_total') and self._last_correctness_total > 0:
+                        log_dict["reward/correctness_rate"] = self._last_correctness_rate
+                        log_dict["reward/correctness_count"] = self._last_correctness_count
+                        log_dict["reward/correctness_total"] = self._last_correctness_total
+                    
+                    # Add expert entropy metric (mode collapse indicator)
+                    if hasattr(self, '_last_expert_entropy'):
+                        log_dict["train/expert_entropy"] = self._last_expert_entropy
+                    
+                    # Add termination binariness metrics
+                    if "switch_prob_mean" in metrics:
+                        log_dict["termination/switch_prob_mean"] = metrics["switch_prob_mean"]
+                        log_dict["termination/switch_prob_std"] = metrics["switch_prob_std"]
+                        log_dict["termination/binary_frac"] = metrics["switch_binary_frac"]
+                        log_dict["termination/entropy"] = metrics["switch_entropy"]
+                        # High switch probability metrics
+                        log_dict["termination/switch_prob_max"] = metrics["switch_prob_max"]
+                        log_dict["termination/switch_prob_p90"] = metrics["switch_prob_p90"]
+                        log_dict["termination/switch_prob_p95"] = metrics["switch_prob_p95"]
+                        log_dict["termination/frac_gt_0.1"] = metrics["frac_gt_0p1"]
+                        log_dict["termination/frac_gt_0.5"] = metrics["frac_gt_0p5"]
+                    
                     wandb.log(log_dict, step=self.global_step)
                 
                 # Save checkpoint
@@ -1287,8 +2986,26 @@ class ActivationControllerTrainer:
                 "epoch": self.epoch,
                 "config": self.config,
             }
+            
+            # Save LLM optimizer state if intra-option update is enabled
+            if self.llm_optimizer is not None:
+                checkpoint["llm_optimizer_state_dict"] = self.llm_optimizer.state_dict()
+            
             torch.save(checkpoint, path)
             print(f"[CHECKPOINT] Saved to {path}")
+            
+            # Save PEFT/LoRA weights if enabled
+            if self.lora_enabled and self.peft_model is not None:
+                import os
+                checkpoint_dir = os.path.dirname(path)
+                lora_dir = os.path.join(checkpoint_dir, f"lora_step_{self.global_step}")
+                self.peft_model.save_pretrained(lora_dir)
+                print(f"[CHECKPOINT] Saved LoRA to {lora_dir}")
+                
+                # Also save to a "latest" folder for easy access
+                lora_latest_dir = os.path.join(checkpoint_dir, "lora_latest")
+                self.peft_model.save_pretrained(lora_latest_dir)
+                print(f"[CHECKPOINT] Saved LoRA (latest) to {lora_latest_dir}")
     
     def load_checkpoint(self, path: str, load_optimizer: bool = True):
         """Load activation controller checkpoint."""
@@ -1303,6 +3020,15 @@ class ActivationControllerTrainer:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except Exception as e:
                 print(f"  [WARN] Failed to load optimizer: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Load LLM optimizer state if available and intra-option update is enabled
+        if load_optimizer and self.llm_optimizer is not None and "llm_optimizer_state_dict" in checkpoint:
+            try:
+                self.llm_optimizer.load_state_dict(checkpoint["llm_optimizer_state_dict"])
+            except Exception as e:
+                print(f"  [WARN] Failed to load LLM optimizer: {e}")
                 import traceback
                 traceback.print_exc()
         

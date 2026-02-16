@@ -144,6 +144,68 @@ def _plackett_luce_sample(
     return selected_indices, total_logprob
 
 
+def _mixed_policy_sample(
+    logits: torch.Tensor, 
+    k: int, 
+    epsilon: float,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """
+    Sample k items from the mixed policy:
+    π_mixed(a) = ε × Uniform(a) + (1-ε) × Plackett-Luce(a | logits)
+    
+    This provides guaranteed exploration without breaking gradient computation
+    in the loss phase (where we use the mixed log-probability).
+    
+    Args:
+        logits: [batch, n] logits over n items
+        k: number of items to sample
+        epsilon: mixture coefficient (0 = pure PL, 1 = pure uniform)
+        generator: optional random generator
+        
+    Returns:
+        selected_indices: [batch, k] - selected expert indices
+    """
+    if epsilon <= 0:
+        # Pure Plackett-Luce sampling
+        selected_indices, _ = _plackett_luce_sample(logits, k, generator, compute_logprob=False)
+        return selected_indices
+    
+    batch_size, num_candidates = logits.shape
+    device = logits.device
+    
+    # Decide which samples use uniform vs Plackett-Luce
+    # Draw per-sample Bernoulli(epsilon) to decide
+    if generator is None:
+        use_uniform = torch.rand(batch_size, device=device) < epsilon
+    else:
+        use_uniform = torch.rand(batch_size, device=device, generator=generator) < epsilon
+    
+    # Sample from Plackett-Luce for all (we'll replace some with uniform)
+    pl_indices, _ = _plackett_luce_sample(logits, k, generator, compute_logprob=False)
+    
+    # Sample uniformly for the ε fraction
+    # Uniform sampling: random permutation, take first k
+    # This is O(n) per sample but only done for ε fraction
+    if use_uniform.any():
+        # Generate uniform samples for those that need it
+        uniform_indices = torch.stack([
+            torch.randperm(num_candidates, device=device, generator=generator)[:k]
+            for _ in range(batch_size)
+        ], dim=0)
+        
+        # Replace PL samples with uniform samples where use_uniform is True
+        selected_indices = torch.where(
+            use_uniform.unsqueeze(-1).expand(-1, k),
+            uniform_indices,
+            pl_indices
+        )
+    else:
+        selected_indices = pl_indices
+    
+    return selected_indices
+
+
 def _plackett_luce_logprob(
     logits: torch.Tensor,
     selections: torch.Tensor,
@@ -176,6 +238,210 @@ def _plackett_luce_logprob(
         # (boolean indexing like remaining[active] creates a copy, so scatter_ wouldn't work)
         remaining[active_rows, step_indices[active_rows]] = float("-inf")
     return total_logprob
+
+
+def _q_based_selection_rnn(
+    controller,  # GptOssController (RNN) with DeepSets and Q-head
+    h_t: torch.Tensor,  # GRU hidden state [batch, hidden_dim]
+    k: int,  # Number of experts to select
+    current_mask: torch.Tensor = None,  # Current option (bool mask) [batch, num_experts]
+    num_steps: int = 10,  # Gradient ascent steps
+    lr: float = 1.0,  # Step size (normalized gradient, so scale-invariant)
+    init_w: float = 2.0,  # Initial weight for current experts
+    debug: bool = False,  # Print debug info
+) -> torch.Tensor:
+    """
+    Select k experts by maximizing Q(s, option) via gradient ascent (for RNN controller).
+    
+    Uses DeepSets: set_embed = mean(phi(expert[i]) for i in set)
+    Starts from current option and optimizes soft weights, then takes top-k.
+    
+    Args:
+        controller: GptOssController with expert_embedding, deepsets_phi, q_head
+        h_t: GRU hidden state [batch, hidden_dim]
+        k: Number of experts to select
+        current_mask: Current option as bool mask [batch, num_experts], used to initialize w
+        num_steps: Gradient ascent steps
+        lr: Step size for normalized gradient update
+        debug: If True, print w at each step
+        
+    Returns:
+        selected_indices: [batch, k]
+    """
+    import torch
+    torch.set_printoptions(threshold=10000, linewidth=200, precision=4, sci_mode=False)
+    
+    batch_size = h_t.shape[0]
+    num_experts = controller.num_experts
+    device = h_t.device
+    
+    target_dtype = controller.q_head[0].weight.dtype
+    h = h_t.detach().to(dtype=target_dtype)  # Detach to avoid affecting outer computation graph
+    
+    if debug:
+        print(f"\n[Q-BASED-SELECTION-RNN] batch_size={batch_size}, num_experts={num_experts}, k={k}, num_steps={num_steps}, lr={lr}", flush=True)
+    
+    # Enable gradients for local optimization (may be inside torch.no_grad() during generation)
+    with torch.enable_grad():
+        # Pre-compute phi for all experts (no grad needed for these)
+        all_phi = controller.deepsets_phi(
+            controller.expert_embedding.weight.to(dtype=target_dtype)
+        ).detach()  # [num_experts, hidden_dim]
+        
+        # Pre-compute h_normed (doesn't change)
+        h_normed = controller.h_rms_norm(h).detach()
+        
+        # Initialize soft weights from current option (if provided)
+        # Set current experts to init_w so softmax concentrates on them initially
+        if current_mask is not None:
+            # Initialize: current experts get init_w, others get 0
+            w_init = torch.where(
+                current_mask.to(dtype=target_dtype, device=device) > 0.5,
+                torch.ones(batch_size, num_experts, device=device, dtype=target_dtype) * init_w,  # init_w for current
+                torch.zeros(batch_size, num_experts, device=device, dtype=target_dtype)  # 0 for others
+            )
+            w = w_init.clone().requires_grad_(True)
+        else:
+            # No current option - start uniform
+            w = torch.zeros(batch_size, num_experts, device=device, dtype=target_dtype, requires_grad=True)
+        
+        if debug:
+            print(f"[Q-BASED-SELECTION-RNN] Step 0 (init): w[0] = {w[0].detach().cpu().tolist()}", flush=True)
+            print(f"[Q-BASED-SELECTION-RNN] init_w = {init_w}", flush=True)
+            if current_mask is not None:
+                print(f"[Q-BASED-SELECTION-RNN] Current option[0] = {current_mask[0].nonzero().squeeze(-1).cpu().tolist()}", flush=True)
+        
+        # Gradient ascent to maximize Q
+        for step in range(num_steps):
+            # Soft weights via softmax
+            soft_weights = torch.softmax(w, dim=-1)  # [batch, num_experts]
+            
+            # Soft set embedding (weighted mean)
+            soft_embed = torch.matmul(soft_weights, all_phi)  # [batch, hidden_dim]
+            
+            # Compute Q
+            s_normed = controller.set_repr_rms_norm(soft_embed)
+            q_input = torch.cat([h_normed, s_normed], dim=-1)
+            q_value = controller.q_head(q_input).squeeze(-1)  # [batch]
+            
+            # Normalized gradient ascent
+            grad_w = torch.autograd.grad(q_value.sum(), w)[0]
+            with torch.no_grad():
+                grad_norm = grad_w.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                w.add_(lr * grad_w / grad_norm)
+            
+            if debug:
+                print(f"[Q-BASED-SELECTION-RNN] Step {step+1}: Q[0]={q_value[0].item():.6f}, grad_norm[0]={grad_norm[0].item():.6f}", flush=True)
+                print(f"[Q-BASED-SELECTION-RNN] Step {step+1}: w[0] = {w[0].detach().cpu().tolist()}", flush=True)
+                print(f"[Q-BASED-SELECTION-RNN] Step {step+1}: softmax(w)[0] top-5 = {torch.topk(soft_weights[0], 5)}", flush=True)
+        
+        # Final selection: top-k
+        _, selected_indices = torch.topk(w.detach(), k, dim=-1)
+    
+    if debug:
+        print(f"[Q-BASED-SELECTION-RNN] Final selected_indices[0] = {selected_indices[0].cpu().tolist()}", flush=True)
+    
+    return selected_indices
+
+
+def _q_based_selection(
+    controller,  # GptOssActivationController with DeepSets and Q-head
+    hidden_states: torch.Tensor,  # LLM hidden states [batch, hidden_size]
+    k: int,  # Number of experts to select
+    current_indices: torch.Tensor = None,  # Current option (indices) [batch, k]
+    num_steps: int = 10,  # Gradient ascent steps
+    lr: float = 1.0,  # Step size (normalized gradient, so scale-invariant)
+    init_w: float = 2.0,  # Initial weight for current experts
+    debug: bool = False,  # Print debug info
+) -> torch.Tensor:
+    """
+    Select k experts by maximizing Q(s, option) via gradient ascent.
+    
+    Uses DeepSets: set_embed = mean(phi(expert[i]) for i in set)
+    Starts from current option and optimizes soft weights, then takes top-k.
+    
+    Args:
+        controller: GptOssActivationController with expert_embedding, deepsets_phi, q_head
+        hidden_states: [batch, hidden_size]
+        k: Number of experts to select
+        current_indices: Current option as indices [batch, k], used to initialize w
+        num_steps: Gradient ascent steps
+        lr: Step size for normalized gradient update
+        debug: If True, print w at each step
+        
+    Returns:
+        selected_indices: [batch, k]
+    """
+    import torch
+    torch.set_printoptions(threshold=10000, linewidth=200, precision=4, sci_mode=False)
+    
+    batch_size = hidden_states.shape[0]
+    num_experts = controller.num_experts
+    device = hidden_states.device
+    
+    target_dtype = controller.q_head[0].weight.dtype
+    h = hidden_states.detach().to(dtype=target_dtype)  # Detach to avoid affecting outer computation graph
+    
+    if debug:
+        print(f"\n[Q-BASED-SELECTION] batch_size={batch_size}, num_experts={num_experts}, k={k}, num_steps={num_steps}, lr={lr}", flush=True)
+    
+    # Enable gradients for local optimization (may be inside torch.no_grad() during generation)
+    with torch.enable_grad():
+        # Pre-compute phi for all experts (no grad needed for these)
+        all_phi = controller.deepsets_phi(
+            controller.expert_embedding.weight.to(dtype=target_dtype)
+        ).detach()  # [num_experts, mlp_hidden_dim]
+        
+        # Pre-compute h_normed (doesn't change)
+        h_normed = controller.h_rms_norm(h).detach()
+        
+        # Initialize soft weights from current option (if provided)
+        if current_indices is not None:
+            # Convert indices to mask, then set init_w for current experts
+            w_init = torch.zeros(batch_size, num_experts, device=device, dtype=target_dtype)
+            w_init.scatter_(1, current_indices.to(device=device), init_w)  # init_w for current
+            w = w_init.clone().requires_grad_(True)
+        else:
+            # No current option - start uniform
+            w = torch.zeros(batch_size, num_experts, device=device, dtype=target_dtype, requires_grad=True)
+        
+        if debug:
+            print(f"[Q-BASED-SELECTION] Step 0 (init): w[0] = {w[0].detach().cpu().tolist()}", flush=True)
+            print(f"[Q-BASED-SELECTION] init_w = {init_w}", flush=True)
+            if current_indices is not None:
+                print(f"[Q-BASED-SELECTION] Current option[0] = {current_indices[0].cpu().tolist()}", flush=True)
+        
+        # Gradient ascent to maximize Q
+        for step in range(num_steps):
+            # Soft weights via softmax
+            soft_weights = torch.softmax(w, dim=-1)  # [batch, num_experts]
+            
+            # Soft set embedding (weighted mean)
+            soft_embed = torch.matmul(soft_weights, all_phi)  # [batch, mlp_hidden_dim]
+            
+            # Compute Q
+            s_normed = controller.set_repr_rms_norm(soft_embed)
+            q_input = torch.cat([h_normed, s_normed], dim=-1)
+            q_value = controller.q_head(q_input).squeeze(-1)  # [batch]
+            
+            # Normalized gradient ascent
+            grad_w = torch.autograd.grad(q_value.sum(), w)[0]
+            with torch.no_grad():
+                grad_norm = grad_w.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                w.add_(lr * grad_w / grad_norm)
+            
+            if debug:
+                print(f"[Q-BASED-SELECTION] Step {step+1}: Q[0]={q_value[0].item():.6f}, grad_norm[0]={grad_norm[0].item():.6f}", flush=True)
+                print(f"[Q-BASED-SELECTION] Step {step+1}: w[0] = {w[0].detach().cpu().tolist()}", flush=True)
+                print(f"[Q-BASED-SELECTION] Step {step+1}: softmax(w)[0] top-5 = {torch.topk(soft_weights[0], 5)}", flush=True)
+        
+        # Final selection: top-k
+        _, selected_indices = torch.topk(w.detach(), k, dim=-1)
+    
+    if debug:
+        print(f"[Q-BASED-SELECTION] Final selected_indices[0] = {selected_indices[0].cpu().tolist()}", flush=True)
+    
+    return selected_indices
 
 
 def _indices_to_mask(indices: torch.Tensor, num_cols: int) -> torch.Tensor:
@@ -245,8 +511,9 @@ class GptOssExperts(nn.Module):
         if hidden_states.device.type == "cpu" or self.training:
             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
             with torch.no_grad():
+                # Ensure router_indices is LongTensor for one_hot (may not be when using LoRA)
                 expert_mask = torch.nn.functional.one_hot(
-                    router_indices, num_classes=num_experts + 1
+                    router_indices.long(), num_classes=num_experts + 1
                 )  # masking is also a class
                 expert_mask = expert_mask.permute(2, 1, 0)
                 # we sum on the top_k and on the sequence length to get which experts
@@ -298,7 +565,15 @@ class GptOssTopKRouter(nn.Module):
 
     def compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        return F.linear(hidden_states, self.weight, self.bias)
+        # Handle dtype mismatch when router params are in float32 for precision
+        # (needed when training router with small learning rates)
+        input_dtype = hidden_states.dtype
+        if self.weight.dtype != hidden_states.dtype:
+            hidden_states = hidden_states.to(self.weight.dtype)
+        result = F.linear(hidden_states, self.weight, self.bias)
+        if result.dtype != input_dtype:
+            result = result.to(input_dtype)
+        return result
 
     def forward(self, hidden_states):
         router_logits = self.compute_router_logits(hidden_states)  # (seq_len, num_experts)
@@ -516,6 +791,10 @@ class GptOssController(nn.Module):
             self.q_head[2].weight.mul_(0.01)
             self.q_head[2].bias.zero_()
         
+        # RMSNorm for Q_U input normalization (fixes scale mismatch between h_t and set_repr)
+        self.h_rms_norm = GptOssRMSNorm(self.hidden_dim)
+        self.set_repr_rms_norm = GptOssRMSNorm(self.hidden_dim)
+        
         # NOTE: dtype is set by from_pretrained() after __init__, so we cannot set it here.
         # Controller parameters are converted to float32 in controller_trainer.py after model loading.
 
@@ -625,8 +904,19 @@ class GptOssController(nn.Module):
         set_repr = transformed.sum(dim=1) / num_valid  # [batch, hidden_dim]
         
         # Concatenate hidden state and set representation for Q computation
-        q_input = torch.cat([h_t, set_repr], dim=-1)  # [batch, 2*hidden_dim]
+        # Apply RMSNorm to balance scales between h_t and set_repr
+        h_t_normed = self.h_rms_norm(h_t)
+        set_repr_normed = self.set_repr_rms_norm(set_repr)
+        q_input = torch.cat([h_t_normed, set_repr_normed], dim=-1)  # [batch, 2*hidden_dim]
         q_u = self.q_head(q_input).squeeze(-1)  # Q_U(s, o)
+        # DEBUG: Track Q_U computation
+        # print(f"[DEBUG-Q_OPTION] selected_indices: {selected_indices[0].tolist() if selected_indices.numel() > 0 else []}")
+        # print(f"[DEBUG-Q_OPTION] expert_embeds norm: {expert_embeds.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION] set_repr norm: {set_repr.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION] h_t norm: {h_t.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION] q_u: {q_u[:3].tolist()}")
+        # print(f"[DEBUG-Q_OPTION] h_t_normed norm: {h_t_normed.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION] set_repr_normed norm: {set_repr_normed.norm(dim=-1).mean().item():.6f}")
         
         return q_u
 
@@ -710,6 +1000,10 @@ class GptOssActivationController(nn.Module):
         with torch.no_grad():
             self.q_head[2].weight.mul_(0.01)
             self.q_head[2].bias.zero_()
+        
+        # RMSNorm for Q_U input normalization (fixes scale mismatch between h and set_repr)
+        self.h_rms_norm = GptOssRMSNorm(self.hidden_size)
+        self.set_repr_rms_norm = GptOssRMSNorm(self.mlp_hidden_dim)
     
     def _compute_set_embedding(self, selected_indices: torch.Tensor, target_dtype: torch.dtype = None) -> torch.Tensor:
         """
@@ -774,7 +1068,10 @@ class GptOssActivationController(nn.Module):
         s = self._compute_set_embedding(current_expert_indices, target_dtype=target_dtype)  # [batch, mlp_hidden_dim]
         
         # Termination head: depends on both h and current option s
-        term_input = torch.cat([h, s], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
+        # Apply RMSNorm to balance scales between h and s (same as Q head)
+        h_normed = self.h_rms_norm(h)
+        s_normed = self.set_repr_rms_norm(s)
+        term_input = torch.cat([h_normed, s_normed], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
         switch_logits = self.termination_head(term_input).squeeze(-1)  # [batch]
         
         # Selection head: depends only on h (like router)
@@ -811,8 +1108,18 @@ class GptOssActivationController(nn.Module):
         s = self._compute_set_embedding(selected_indices, target_dtype=target_dtype)  # [batch, mlp_hidden_dim]
         
         # Q head
-        q_input = torch.cat([h, s], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
+        # Apply RMSNorm to balance scales between h and set_repr
+        h_normed = self.h_rms_norm(h)
+        s_normed = self.set_repr_rms_norm(s)
+        q_input = torch.cat([h_normed, s_normed], dim=-1)  # [batch, hidden_size + mlp_hidden_dim]
         q_u = self.q_head(q_input).squeeze(-1)  # [batch]
+        # DEBUG: Track Q_U computation (Activation controller)
+        # print(f"[DEBUG-Q_OPTION-ACT] selected_indices: {selected_indices[0].tolist() if selected_indices.numel() > 0 else []}")
+        # print(f"[DEBUG-Q_OPTION-ACT] s (set_embed) norm: {s.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION-ACT] h norm: {h.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION-ACT] q_u: {q_u[:3].tolist()}")
+        # print(f"[DEBUG-Q_OPTION-ACT] h_normed norm: {h_normed.norm(dim=-1).mean().item():.6f}")
+        # print(f"[DEBUG-Q_OPTION-ACT] s_normed norm: {s_normed.norm(dim=-1).mean().item():.6f}")
         
         # Return float32 for numerical stability
         return q_u.float()
@@ -858,7 +1165,12 @@ class GptOssMLP(nn.Module):
         if routing_data is None:
             routing_data = routing_weights
         try:
-            sig = inspect.signature(self.experts.forward)
+            # Handle PEFT-wrapped experts: get the actual underlying module's signature
+            # PEFT's ParamWrapper has a get_base_layer() method to access the wrapped module
+            experts_module = self.experts
+            while hasattr(experts_module, 'get_base_layer'):
+                experts_module = experts_module.get_base_layer()
+            sig = inspect.signature(experts_module.forward)
             param_names = [p.name for p in sig.parameters.values()][1:]  # skip 'self'
         except Exception:
             param_names = []
@@ -984,6 +1296,7 @@ class GptOssMLP(nn.Module):
         switch_probs = torch.sigmoid(switch_logits)
         sampling_mode = _runtime_flag(runtime_config, "sampling", False) and replay_payload is None
         generator = _runtime_get(runtime_config, "generator", None)
+        selection_epsilon = _runtime_get(runtime_config, "selection_epsilon", 0.0)  # ε-greedy mixture
         
         # DEBUG: Print switch_logits on first few calls to diagnose high switch rate
         if not hasattr(self, '_debug_switch_count'):
@@ -991,7 +1304,7 @@ class GptOssMLP(nn.Module):
         if self._debug_switch_count < 5:
             print(f"  [DEBUG-SWITCH-INFERENCE] switch_logits: mean={switch_logits.mean().item():.4f}, "
                   f"min={switch_logits.min().item():.4f}, max={switch_logits.max().item():.4f}, "
-                  f"switch_probs: mean={switch_probs.mean().item():.4f}", flush=True)
+                  f"switch_probs: mean={switch_probs.mean().item():.4f}, selection_epsilon={selection_epsilon}", flush=True)
             self._debug_switch_count += 1
         
         # Determine switch decision
@@ -1021,18 +1334,76 @@ class GptOssMLP(nn.Module):
         # Use float32 for log probabilities (controller outputs are float32 for numerical stability)
         active = torch.nonzero(switch_decision).squeeze(-1)
 
+        # Check for Q-based selection mode
+        q_based_selection = _runtime_flag(runtime_config, "q_based_selection", False)
+        q_selection_steps = _runtime_get(runtime_config, "q_selection_steps", 10)
+        q_selection_lr = _runtime_get(runtime_config, "q_selection_lr", 1.0)
+        q_selection_epsilon = _runtime_get(runtime_config, "q_selection_epsilon", 0.1)
+        q_selection_debug = _runtime_flag(runtime_config, "q_selection_debug", False)
+        q_selection_init_w = _runtime_get(runtime_config, "q_selection_init_w", 2.0)
+        
         if replay_payload is not None:
             # During replay: use recorded indices for ALL samples
             selected_indices = replay_payload["selected_indices"].to(dtype=torch.long, device=router_softmax.device)
             # Compute log_prob for ALL samples (not just active)
+            # Note: log_prob during replay is only used for debugging, not for gradients
             selection_logprob = _plackett_luce_logprob(candidate_logits, selected_indices)
+        elif q_based_selection:
+            # Q-based selection: maximize Q(s, option) via gradient ascent
+            # Works for both training and inference - no selection policy needed
+            # Use ε-greedy exploration: with prob ε, sample uniform; else argmax Q
+            if sampling_mode and q_selection_epsilon > 0:
+                # ε-greedy: some samples use uniform random selection
+                use_uniform = torch.rand(batch_size, device=router_softmax.device) < q_selection_epsilon
+                
+                # Get Q-based selection for all (starting from current option)
+                q_selected = _q_based_selection_rnn(
+                    self.controller,
+                    h_t,
+                    k=self.controller_allowed_experts,
+                    current_mask=allowed_mask,  # Start from current option
+                    num_steps=q_selection_steps,
+                    lr=q_selection_lr,
+                    init_w=q_selection_init_w,
+                    debug=q_selection_debug,
+                )
+                
+                # Get uniform random selection
+                uniform_selected = torch.stack([
+                    torch.randperm(self.experts.num_experts, device=router_softmax.device, generator=generator)[:self.controller_allowed_experts]
+                    for _ in range(batch_size)
+                ], dim=0)
+                
+                # Mix based on ε
+                selected_indices = torch.where(
+                    use_uniform.unsqueeze(-1).expand(-1, self.controller_allowed_experts),
+                    uniform_selected,
+                    q_selected
+                )
+            else:
+                # Pure argmax Q (greedy, starting from current option)
+                selected_indices = _q_based_selection_rnn(
+                    self.controller,
+                    h_t,
+                    k=self.controller_allowed_experts,
+                    current_mask=allowed_mask,  # Start from current option
+                    num_steps=q_selection_steps,
+                    lr=q_selection_lr,
+                    init_w=q_selection_init_w,
+                    debug=q_selection_debug,
+                )
+            selection_logprob = torch.zeros(batch_size, device=router_softmax.device, dtype=torch.float32)
         elif sampling_mode:
-            # During sampling: sample for ALL samples
-            selected_indices, selection_logprob = _plackett_luce_sample(
+            # During sampling: sample from mixed policy π_mixed = ε×Uniform + (1-ε)×PL
+            # This provides guaranteed exploration without breaking gradient computation
+            selected_indices = _mixed_policy_sample(
                 candidate_logits,
                 self.controller_allowed_experts,
+                epsilon=selection_epsilon,
                 generator=generator,
             )
+            # Log-prob is computed later in the loss with the mixed formula
+            selection_logprob = torch.zeros(batch_size, device=router_softmax.device, dtype=torch.float32)
         else:
             # Greedy mode: topk for ALL samples
             selected_indices = torch.topk(candidate_logits, self.controller_allowed_experts, dim=-1).indices
@@ -1110,6 +1481,7 @@ class GptOssMLP(nn.Module):
         switch_probs = torch.sigmoid(switch_logits)
         sampling_mode = _runtime_flag(runtime_config, "sampling", False) and replay_payload is None
         generator = _runtime_get(runtime_config, "generator", None)
+        selection_epsilon = _runtime_get(runtime_config, "selection_epsilon", 0.0)  # ε-greedy mixture
         
         # DEBUG: Print switch_logits and compare candidate_logits vs router_logits on first few calls
         if not hasattr(self, '_debug_act_switch_count'):
@@ -1122,7 +1494,7 @@ class GptOssMLP(nn.Module):
             weight_diff = (self.router.weight.data.float() - self.controller.selection_head.weight.data.float()).abs().max().item()
             print(f"  [DEBUG-ACT] switch_prob={switch_probs.mean().item():.4f}, "
                   f"top-{self.controller_allowed_experts}_match={match_rate:.4f}, "
-                  f"weight_diff={weight_diff:.6f}", flush=True)
+                  f"weight_diff={weight_diff:.6f}, selection_epsilon={selection_epsilon}", flush=True)
             self._debug_act_switch_count += 1
         
         # Determine switch decision
@@ -1143,15 +1515,74 @@ class GptOssMLP(nn.Module):
         )
         
         # Expert selection
+        # Check for Q-based selection mode
+        q_based_selection = _runtime_flag(runtime_config, "q_based_selection", False)
+        q_selection_steps = _runtime_get(runtime_config, "q_selection_steps", 10)
+        q_selection_lr = _runtime_get(runtime_config, "q_selection_lr", 1.0)
+        q_selection_epsilon = _runtime_get(runtime_config, "q_selection_epsilon", 0.1)  # ε-greedy for Q-based
+        q_selection_init_w = _runtime_get(runtime_config, "q_selection_init_w", 2.0)
+        
         if replay_payload is not None:
             selected_indices = replay_payload["selected_indices"].to(dtype=torch.long, device=device)
+            # Log-prob during replay is only used for debugging, not for gradients
             selection_logprob = _plackett_luce_logprob(candidate_logits, selected_indices)
+        elif q_based_selection:
+            # Q-based selection: maximize Q(s, option) via gradient ascent
+            # Works for both training and inference - no selection policy needed
+            # Use ε-greedy exploration: with prob ε, sample uniform; else argmax Q
+            if sampling_mode and q_selection_epsilon > 0:
+                # ε-greedy: some samples use uniform random selection
+                use_uniform = torch.rand(batch_size, device=device) < q_selection_epsilon
+                
+                # Get Q-based selection for all (starting from current option)
+                q_selection_debug = _runtime_flag(runtime_config, "q_selection_debug", False)
+                q_selected = _q_based_selection(
+                    self.controller,
+                    llm_hidden_states,
+                    k=self.controller_allowed_experts,
+                    current_indices=current_expert_indices,  # Start from current option
+                    num_steps=q_selection_steps,
+                    lr=q_selection_lr,
+                    init_w=q_selection_init_w,
+                    debug=q_selection_debug,
+                )
+                
+                # Get uniform random selection
+                uniform_selected = torch.stack([
+                    torch.randperm(self.experts.num_experts, device=device, generator=generator)[:self.controller_allowed_experts]
+                    for _ in range(batch_size)
+                ], dim=0)
+                
+                # Mix based on ε
+                selected_indices = torch.where(
+                    use_uniform.unsqueeze(-1).expand(-1, self.controller_allowed_experts),
+                    uniform_selected,
+                    q_selected
+                )
+            else:
+                # Pure argmax Q (greedy, starting from current option)
+                q_selection_debug = _runtime_flag(runtime_config, "q_selection_debug", False)
+                selected_indices = _q_based_selection(
+                    self.controller,
+                    llm_hidden_states,
+                    k=self.controller_allowed_experts,
+                    current_indices=current_expert_indices,  # Start from current option
+                    num_steps=q_selection_steps,
+                    lr=q_selection_lr,
+                    init_w=q_selection_init_w,
+                    debug=q_selection_debug,
+                )
+            selection_logprob = torch.zeros(batch_size, device=device, dtype=torch.float32)
         elif sampling_mode:
-            selected_indices, selection_logprob = _plackett_luce_sample(
+            # Sample from mixed policy π_mixed = ε×Uniform + (1-ε)×PL
+            selected_indices = _mixed_policy_sample(
                 candidate_logits,
                 self.controller_allowed_experts,
+                epsilon=selection_epsilon,
                 generator=generator,
             )
+            # Log-prob is computed later in the loss with the mixed formula
+            selection_logprob = torch.zeros(batch_size, device=device, dtype=torch.float32)
         else:
             selected_indices = torch.topk(candidate_logits, self.controller_allowed_experts, dim=-1).indices
             selection_logprob = torch.zeros(batch_size, device=device, dtype=torch.float32)

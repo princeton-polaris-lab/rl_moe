@@ -170,6 +170,18 @@ class KLReward:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
+        # Save original router weights for frozen teacher evaluation.
+        # disable_adapter() only disables LoRA, not router weight updates.
+        self._original_router_weights = {}
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped, 'policy'):
+            unwrapped = unwrapped.policy
+        for name, param in unwrapped.named_parameters():
+            if 'router' in name:
+                self._original_router_weights[name] = param.data.clone()
+        if self.accelerator.is_main_process:
+            print(f"[KL-REWARD] Saved {len(self._original_router_weights)} original router weight tensors for frozen teacher")
+        
         # Store last batch metrics for logging
         self.last_batch_kl_mean = 0.0
         self.last_batch_kl_std = 0.0
@@ -183,6 +195,21 @@ class KLReward:
         self._student_ppl_sum = 0.0
         self._sample_count = 0
     
+    def _swap_router_weights(self, model, use_original: bool):
+        """Swap router weights between original (frozen) and current (trained) values."""
+        model_params = dict(model.named_parameters())
+        for name, original_data in self._original_router_weights.items():
+            if name in model_params:
+                param = model_params[name]
+                if use_original:
+                    if not hasattr(self, '_current_router_weights'):
+                        self._current_router_weights = {}
+                    self._current_router_weights[name] = param.data.clone()
+                    param.data.copy_(original_data)
+                else:
+                    if hasattr(self, '_current_router_weights') and name in self._current_router_weights:
+                        param.data.copy_(self._current_router_weights[name])
+
     def reset_batch_stats(self):
         """Reset accumulated stats at the start of each training step."""
         self._kl_sum = 0.0
@@ -377,11 +404,11 @@ class KLReward:
             print(f"[KL-TEACHER] Controller: {len(controller_values)} GptOssMLP modules, all disabled={all_controller_disabled}", flush=True)
         
         with torch.no_grad():
+            # Swap in original router weights for true frozen teacher
+            self._swap_router_weights(unwrapped_model, use_original=True)
             if is_peft:
                 with unwrapped_model.disable_adapter():
                     if debug_idx == 0:
-                        # Verify LoRA is disabled: check ParamWrapper._disable_adapters
-                        # ParamWrapper.forward() checks self._disable_adapters to decide whether to apply LoRA
                         lora_values = []
                         for name, module in unwrapped_model.named_modules():
                             if module.__class__.__name__ == 'ParamWrapper' and hasattr(module, '_disable_adapters'):
@@ -402,6 +429,8 @@ class KLReward:
                     attention_mask=attention_mask,
                     labels=labels,
                 )
+            # Restore trained router weights
+            self._swap_router_weights(unwrapped_model, use_original=False)
             teacher_logits = teacher_outputs.logits  # [1, seq_len, vocab]
             teacher_loss = teacher_outputs.loss
         
@@ -1410,6 +1439,12 @@ def parse_args() -> argparse.Namespace:
                         help="Controller type: 'rnn' (default, GRU-based) or 'activation' (uses LLM hidden states directly)")
     parser.add_argument("--activation-controller-mlp-hidden", type=int, default=512,
                         help="Hidden dimension for activation controller MLPs (termination and Q heads)")
+    parser.add_argument("--joint-option", type=int, default=0,
+                        help="Use joint (shared) option across all layers: 0=per-layer (default), 1=joint option")
+    parser.add_argument("--joint-set-embed-dim", type=int, default=3072,
+                        help="DeepSets output dimension for joint expert set embedding (joint option mode)")
+    parser.add_argument("--joint-controller-mlp-hidden", type=int, default=4096,
+                        help="MLP hidden dim for joint controller termination and Q heads")
     
     # Data
     parser.add_argument("--data-dir", type=Path, 
@@ -1688,6 +1723,10 @@ def main() -> None:
     config.activation_controller_mlp_hidden = args.activation_controller_mlp_hidden
     # Controller type: "rnn" (GRU-based) or "activation" (uses LLM hidden states directly)
     config.controller_type = args.controller_type
+    # Joint option: single shared option across all layers (only for activation controller)
+    config.joint_option = bool(args.joint_option)
+    config.joint_set_embed_dim = args.joint_set_embed_dim
+    config.joint_controller_mlp_hidden = args.joint_controller_mlp_hidden
     
     if accelerator.is_main_process:
         print(f"[CONFIG] model_type = {config.model_type}")
@@ -1698,6 +1737,9 @@ def main() -> None:
         print(f"[CONFIG] controller_expert_embed_dim = {config.controller_expert_embed_dim}")
         print(f"[CONFIG] activation_controller_mlp_hidden = {config.activation_controller_mlp_hidden}")
         print(f"[CONFIG] controller_type = {config.controller_type}")
+        print(f"[CONFIG] joint_option = {config.joint_option}")
+        print(f"[CONFIG] joint_set_embed_dim = {config.joint_set_embed_dim}")
+        print(f"[CONFIG] joint_controller_mlp_hidden = {config.joint_controller_mlp_hidden}")
     
     # Load model
     if accelerator.is_main_process:
@@ -1772,7 +1814,7 @@ def main() -> None:
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=0.0,
-            target_modules=[],  # Empty - do NOT train attention layers
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             target_parameters=target_parameters,  # Expert parameters for all 24 layers
             bias="none",
             task_type="CAUSAL_LM",
@@ -1946,6 +1988,10 @@ def main() -> None:
         q_selection_init_w=args.q_selection_init_w,
         # Teacher-mixed sampling
         teacher_mix_alpha=args.teacher_mix_alpha,
+        # Joint option
+        joint_option=bool(args.joint_option),
+        joint_set_embed_dim=args.joint_set_embed_dim,
+        joint_controller_mlp_hidden=args.joint_controller_mlp_hidden,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         seed=args.seed,

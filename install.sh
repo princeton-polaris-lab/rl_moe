@@ -53,11 +53,14 @@ fi
 BACKUP_DIR="$SCRIPT_DIR/.transformers_backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR/models/gpt_oss"
 mkdir -p "$BACKUP_DIR/integrations"
+mkdir -p "$BACKUP_DIR/generation"
 
 echo "Backing up original files..."
 cp "$TRANSFORMERS_DIR/models/gpt_oss/modeling_gpt_oss.py" "$BACKUP_DIR/models/gpt_oss/" 2>/dev/null && echo "  - Backed up modeling_gpt_oss.py"
 cp "$TRANSFORMERS_DIR/models/gpt_oss/configuration_gpt_oss.py" "$BACKUP_DIR/models/gpt_oss/" 2>/dev/null && echo "  - Backed up configuration_gpt_oss.py"
 cp "$TRANSFORMERS_DIR/integrations/mxfp4.py" "$BACKUP_DIR/integrations/" 2>/dev/null && echo "  - Backed up mxfp4.py"
+cp "$TRANSFORMERS_DIR/modeling_outputs.py" "$BACKUP_DIR/" 2>/dev/null && echo "  - Backed up modeling_outputs.py"
+cp "$TRANSFORMERS_DIR/generation/utils.py" "$BACKUP_DIR/generation/" 2>/dev/null && echo "  - Backed up generation/utils.py"
 echo ""
 
 # Copy patched files
@@ -65,6 +68,12 @@ echo "Copying patched files..."
 cp "$PATCHES_DIR/models/gpt_oss/modeling_gpt_oss.py" "$TRANSFORMERS_DIR/models/gpt_oss/" && echo "  ✓ modeling_gpt_oss.py"
 cp "$PATCHES_DIR/models/gpt_oss/configuration_gpt_oss.py" "$TRANSFORMERS_DIR/models/gpt_oss/" && echo "  ✓ configuration_gpt_oss.py"
 cp "$PATCHES_DIR/integrations/mxfp4.py" "$TRANSFORMERS_DIR/integrations/" && echo "  ✓ mxfp4.py"
+cp "$PATCHES_DIR/modeling_outputs.py" "$TRANSFORMERS_DIR/" && echo "  ✓ modeling_outputs.py"
+
+# Copy generation/utils.py if it exists in patches
+if [ -f "$PATCHES_DIR/generation/utils.py" ]; then
+    cp "$PATCHES_DIR/generation/utils.py" "$TRANSFORMERS_DIR/generation/" && echo "  ✓ generation/utils.py"
+fi
 
 # Copy __init__.py for gpt_oss if it exists in patches
 if [ -f "$PATCHES_DIR/models/gpt_oss/__init__.py" ]; then
@@ -84,4 +93,4 @@ echo "Backup saved to:"
 echo "  $BACKUP_DIR"
 echo ""
 echo "You can now run controller training with:"
-echo "  sbatch launch_grid.sh"
+echo "  sbatch launch_grid_activation.sh"

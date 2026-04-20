@@ -1,11 +1,22 @@
 #!/bin/bash
 
+# =========================================================================
+# Launch target: "slurm" (school cluster) or "vast" (vast.ai remote GPU)
+# =========================================================================
+LAUNCH_TARGET=slurm  # "slurm" or "vast"
+
+# vast.ai SSH connection (only used when LAUNCH_TARGET=vast)
+VAST_SSH_HOST="212.247.220.194"
+VAST_SSH_PORT="25092"
+VAST_SSH_USER="root"
+VAST_REMOTE_DIR="/workspace/rl_moe"
+
 # Root paths (edit these if you move the project or change model/data locations)
 BASE_DIR=/scratch/gpfs/HENDERSON/zs7353/rl_moe
 ENV_PATH=/scratch/gpfs/HENDERSON/zs7353/envs/trl
 MODEL_PATH=/scratch/gpfs/KOROLOVA/gpt-oss-20b
 # Data paths - update these based on DATASET_TYPE
-DATASET_TYPE=math  # 'mmlu' for MMLU multiple-choice, 'nemotron' for open-ended, 'math' for Hendrycks MATH
+DATASET_TYPE=nemotron  # 'mmlu' for MMLU multiple-choice, 'nemotron' for open-ended, 'math' for Hendrycks MATH
 if [ "$DATASET_TYPE" = "mmlu" ]; then
     DATA_DIR=/scratch/gpfs/HENDERSON/zs7353/mmlu
 elif [ "$DATASET_TYPE" = "math" ]; then
@@ -17,7 +28,7 @@ MATH_DATA_DIR=/scratch/gpfs/HENDERSON/zs7353/rl_moe/hendrycks_math
 MATH_SPLIT=train  # 'train' for training, 'test' for eval
 # Category filter for Nemotron dataset (comma-separated, e.g., "math" or "math,code")
 # Set to empty string "" to use all categories
-DATA_CATEGORIES="math"
+DATA_CATEGORIES=""
 # DATA_CATEGORIES=""
 OUTPUT_ROOT=${BASE_DIR}/controller_rl_grid
 LOG_DIR=${BASE_DIR}/logs
@@ -29,13 +40,12 @@ PROMPTS_PER_CATEGORY=10000 # for math only
 # PROMPTS_PER_CATEGORY=2000
 MAX_PROMPT_LENGTH=512
 # with correctness reward, we need the rollouts in one batch to come from the same prompt
-NUM_ROLLOUTS_PER_PROMPT=0  # Number of rollouts per prompt (1=different prompts, 4=same prompt x4 rollouts)
-# NUM_ROLLOUTS_PER_PROMPT=1
+NUM_ROLLOUTS_PER_PROMPT=1
 # Response length for generation (grid-searchable)
 # RESPONSE_LENGTHS=(1024)
-RESPONSE_LENGTHS=(512)  # To compare different response lengths
-TOKEN_TEMPERATURE=0.5  # Temperature for token sampling (lower = more deterministic)
-# TOKEN_TEMPERATURE=0 # no intra-option policy update
+RESPONSE_LENGTHS=(1024)  # To compare different response lengths
+TOKEN_TEMPERATURE=1  # Temperature for token sampling (lower = more deterministic)
+# TOKEN_TEMPERATURE=0.5 # no intra-option policy update
 SEED=42
 
 # Reward settings
@@ -51,18 +61,22 @@ ENTROPY_COEFS=(0)  # Entropy bonus: 0 = disabled, try 0.01-0.1 to encourage expl
 
 # Logging
 LOGGING_STEPS=1
-SAVE_STEPS=20
+SAVE_STEPS=20  # For SLURM; vast.ai overrides to 9999 to avoid disk-full crashes
 
-# Resume from checkpoint (empty string = start fresh, or path to .pt file, or "latest")
+# Resume from checkpoint
+# RESUME_CHECKPOINT: empty = start fresh, path = specific checkpoint, "latest" = latest in output_dir
 # RESUME_CHECKPOINT="/scratch/gpfs/HENDERSON/zs7353/rl_moe/controller_rl_grid/lat0_exp16_lr1e-3_pp32_ga2_vc0.01_sb-3_hd512_ln1_rwd_kl_grpo4/controller_step_380.pt"
 RESUME_CHECKPOINT=""
+# AUTO_RESUME: if 1, automatically find the latest checkpoint in the job's output directory.
+# This overrides RESUME_CHECKPOINT. Useful for continuing interrupted runs.
+AUTO_RESUME=1
 
 # Grid definitions (edit these arrays to change the sweep)
 LATENCY_COSTS=(0)
 # LATENCY_COSTS=(100)
-ALLOWED_EXPERTS=(16)
+ALLOWED_EXPERTS=(8)
 # ALLOWED_EXPERTS=(16)
-LEARNING_RATES=(1e-4)
+LEARNING_RATES=(2e-4)
 # LEARNING_RATES=(1e-3 1e-4)
 # PROMPTS_PER_STEP=(32)    # Total prompts per step (across all GPUs), 32 for grpo, 16 for option critic
 PROMPTS_PER_STEP=(16)
@@ -80,7 +94,7 @@ CONTROLLER_TYPE=activation  # "rnn" or "activation". Remember to implement intra
 ACTIVATION_MLP_HIDDEN=1024   # Hidden dim for activation controller MLPs (termination and Q heads)
 
 # Option-Critic settings
-DELIBERATION_COSTS=(0.05)  # activation based controller
+DELIBERATION_COSTS=(0.02 0.04)  # activation based controller
 GAMMAS=(0.95)  # Discount factor for TD targets (grid searchable)
 # GAMMAS=(0.9)
 GAE_LAMBDA=0.95  # GAE lambda for bias-variance tradeoff (0=TD(0), 1=MC)
@@ -94,9 +108,9 @@ INTRA_OPTION_LRS=(2e-4)   # Learning rate for LLM (LoRA + router) params (grid s
 INTRA_OPTION_WARMUP_STEPS=0  # Skip LLM updates for first N steps (let value function warm up)
 INTRA_OPTION_Q_BASELINES=(0)  # Use Q(s,o) baseline for intra-option gradient (A2OC: G-Q). 0=off, 1=on
 # INTRA_OPTION_Q_BASELINES=(1 0)  # To compare with and without Q baseline
-LORA_RS=(16)            # LoRA rank for expert adapters (grid searchable)
+LORA_RS=(64)            # LoRA rank for expert adapters (grid searchable)
 # LORA_RS=(4 8 16)
-LORA_ALPHA=16          # LoRA alpha scaling factor
+LORA_ALPHA=64          # LoRA alpha scaling factor
 
 # Termination advantage RMS normalization
 # Helps when advantage variance collapses during training
@@ -114,14 +128,14 @@ TERM_TOPK_KS=(1000)  # Grid-searchable: e.g., (100 500 1000)
 # Q-based expert selection (alternative to Plackett-Luce)
 # Selects options via argmax Q instead of learned Plackett-Luce policy
 # When enabled, no selection policy gradient is computed - only Q is trained via TD
-Q_BASED_SELECTIONS=(1)  # 0=Plackett-Luce, 1=Q-based (grid searchable)
+Q_BASED_SELECTIONS=(0)  # 0=Plackett-Luce, 1=Q-based (grid searchable)
 # Q_BASED_SELECTIONS=(0 1)  # To compare PL vs Q-based
 Q_SELECTION_STEPS=10      # Number of gradient ascent steps for Q-based
 Q_SELECTION_LR=1.0        # Learning rate for Q-based optimization
 Q_SELECTION_EPSILONS=(0)  # Fixed ε for Q-based selection (if not using annealing)
 # Q_SELECTION_EPSILONS=(0.0 0.1 0.2)  # To compare different exploration rates
 # Annealing schedule for Q-based selection epsilon
-Q_SELECTION_EPSILON_START=1  # Starting ε (set to "" to disable annealing)
+Q_SELECTION_EPSILON_START=""  # Starting ε (set to "" to disable annealing)
 Q_SELECTION_EPSILON_END=0.1   # Final ε after annealing
 Q_SELECTION_EPSILON_ANNEAL_STEPS=200  # Steps to anneal over
 Q_SELECTION_DEBUG=0       # 1=print debug info for Q-based selection
@@ -134,9 +148,9 @@ Q_SELECTION_INIT_WS=(1.0) # Initial weight for current experts in Q-based select
 # NOTE: Only used when Q_BASED_SELECTION=0 (Plackett-Luce)
 SELECTION_EPSILONS=(0)  # Fixed epsilon (if not using annealing)
 # Annealing schedule for Plackett-Luce epsilon (leave empty to disable)
-SELECTION_EPSILON_START=""  # e.g., "0.5" to enable annealing from 0.5
-SELECTION_EPSILON_END=0.05
-SELECTION_EPSILON_ANNEAL_STEPS=200
+SELECTION_EPSILON_START=1  # e.g., "0.5" to enable annealing from 0.5
+SELECTION_EPSILON_END=0.1
+SELECTION_EPSILON_ANNEAL_STEPS=50
 
 # Repetition penalty (distance-based)
 # For each token, penalty = c * λ^d where d is distance to previous occurrence
@@ -163,7 +177,7 @@ NODES=1
 CPUS_PER_TASK=8
 MEMORY=512G
 GPUS_PER_JOB=4
-TIME_LIMIT=72:00:00
+TIME_LIMIT=23:59:00
 # TIME_LIMIT=00:59:00
 
 
@@ -368,14 +382,128 @@ for latency in "${LATENCY_COSTS[@]}"; do
           output_dir="${OUTPUT_ROOT}/${job_tag}"
           job_name="ctrl_${job_tag}"
           
-          # Build resume flag (empty if not resuming)
-          if [ -n "$RESUME_CHECKPOINT" ]; then
+          # Build resume flag
+          RESUME_FLAG=""
+          if [ "$AUTO_RESUME" = "1" ]; then
+            # Auto-find latest checkpoint in this job's output directory
+            # Check both local (SLURM) and remote (vast.ai) paths
+            if [ "$LAUNCH_TARGET" = "vast" ]; then
+              AUTO_CKPT_DIR="${VAST_REMOTE_DIR}/controller_rl_grid/${job_tag}"
+              LATEST_CKPT=$(ssh -p ${VAST_SSH_PORT} -o ConnectTimeout=5 ${VAST_SSH_USER}@${VAST_SSH_HOST} \
+                "ls -t ${AUTO_CKPT_DIR}/activation_controller_step_*.pt 2>/dev/null | head -1" 2>/dev/null | tail -1)
+              if [ -z "$LATEST_CKPT" ]; then
+                LATEST_CKPT=$(ssh -p ${VAST_SSH_PORT} -o ConnectTimeout=5 ${VAST_SSH_USER}@${VAST_SSH_HOST} \
+                  "ls ${AUTO_CKPT_DIR}/activation_controller_latest.pt 2>/dev/null" 2>/dev/null | tail -1)
+              fi
+            else
+              AUTO_CKPT_DIR="${OUTPUT_ROOT}/${job_tag}"
+              LATEST_CKPT=$(ls -t ${AUTO_CKPT_DIR}/activation_controller_step_*.pt 2>/dev/null | head -1)
+              if [ -z "$LATEST_CKPT" ]; then
+                LATEST_CKPT=$(ls ${AUTO_CKPT_DIR}/activation_controller_latest.pt 2>/dev/null)
+              fi
+            fi
+            if [ -n "$LATEST_CKPT" ]; then
+              RESUME_FLAG="--resume-from-checkpoint ${LATEST_CKPT}"
+              echo "  AUTO_RESUME: Found checkpoint ${LATEST_CKPT}"
+            else
+              echo "  AUTO_RESUME: No checkpoint found in ${AUTO_CKPT_DIR:-output_dir}, starting fresh"
+            fi
+          elif [ -n "$RESUME_CHECKPOINT" ]; then
             RESUME_FLAG="--resume-from-checkpoint ${RESUME_CHECKPOINT}"
-          else
-            RESUME_FLAG=""
           fi
 
-          sbatch <<EOF
+          # Build the training arguments (shared between SLURM and vast.ai)
+          TRAIN_ARGS="--data-dir ${DATA_DIR} \
+  --dataset-type ${DATASET_TYPE} \
+  --data-categories \"${DATA_CATEGORIES}\" \
+  --math-data-dir ${MATH_DATA_DIR} \
+  --math-split ${MATH_SPLIT} \
+  --correctness-reward-alpha ${corr_alpha} \
+  --output-dir ${output_dir} \
+  --controller-allowed-experts ${experts} \
+  --prompts-per-category ${PROMPTS_PER_CATEGORY} \
+  --max-prompt-length ${MAX_PROMPT_LENGTH} \
+  --num-rollouts-per-prompt ${NUM_ROLLOUTS_PER_PROMPT} \
+  --response-length ${resp_len} \
+  --token-temperature ${TOKEN_TEMPERATURE} \
+  --learning-rate ${lr} \
+  --latency-cost ${latency} \
+  --per-device-train-batch ${per_device_batch} \
+  --gradient-accumulation ${grad_acc} \
+  --num-train-epochs ${NUM_TRAIN_EPOCHS} \
+  --num-update-epochs ${NUM_UPDATE_EPOCHS} \
+  --value-coef ${value_coef} \
+  --entropy-coef ${entropy_coef} \
+  --seed ${SEED} \
+  --kl-reward-scale ${KL_REWARD_SCALE} \
+  --logging-steps ${LOGGING_STEPS} \
+  --save-steps ${SAVE_STEPS} \
+  --switch-init-bias ${switch_bias} \
+  --controller-hidden-dim ${hidden_dim} \
+  --controller-expert-embed-dim ${expert_embed_dim} \
+  --controller-layer-norm ${layer_norm} \
+  --controller-input-type ${input_type} \
+  --deliberation-cost ${delib_cost} \
+  --gamma ${gamma} \
+  --gae-lambda ${GAE_LAMBDA} \
+  --controller-type ${CONTROLLER_TYPE} \
+  --activation-controller-mlp-hidden ${ACTIVATION_MLP_HIDDEN} \
+  --intra-option-update ${INTRA_OPTION_UPDATE} \
+  --intra-option-lr ${intra_lr} \
+  --intra-option-warmup-steps ${INTRA_OPTION_WARMUP_STEPS} \
+  --intra-option-q-baseline ${q_baseline} \
+  --lora-r ${lora_r} \
+  --lora-alpha ${LORA_ALPHA} \
+  --selection-epsilon ${sel_eps} \
+  ${SELECTION_EPSILON_ANNEAL_ARGS} \
+  --term-adv-rms-norm ${term_rms} \
+  --q-based-selection ${q_based} \
+  --q-selection-steps ${Q_SELECTION_STEPS} \
+  --q-selection-lr ${Q_SELECTION_LR} \
+  --q-selection-epsilon ${q_sel_eps} \
+  ${Q_SELECTION_EPSILON_ANNEAL_ARGS} \
+  --q-selection-debug ${Q_SELECTION_DEBUG} \
+  --q-selection-init-w ${q_init_w} \
+  --repetition-penalty-c ${rep_c} \
+  --repetition-penalty-decay ${rep_decay} \
+  --term-topk-lambda ${term_topk_lambda} \
+  --term-topk-k ${term_topk_k} \
+  --teacher-mix-alpha ${teach_alpha} \
+  ${RESUME_FLAG}"
+
+          if [ "$LAUNCH_TARGET" = "vast" ]; then
+            # =========================================================
+            # vast.ai: SSH into remote instance and run training
+            # =========================================================
+            if [ -z "$VAST_SSH_HOST" ] || [ -z "$VAST_SSH_PORT" ]; then
+              echo "ERROR: VAST_SSH_HOST and VAST_SSH_PORT must be set for LAUNCH_TARGET=vast"
+              exit 1
+            fi
+
+            VAST_MODEL_PATH="/workspace/gpt-oss-20b"
+            VAST_DATA_DIR="${VAST_REMOTE_DIR}/hendrycks_math"
+            VAST_OUTPUT_DIR="${VAST_REMOTE_DIR}/controller_rl_grid/${job_tag}"
+            VAST_MATH_DATA_DIR="${VAST_REMOTE_DIR}/hendrycks_math"
+
+            # Override paths and save_steps for vast.ai (disk is limited)
+            VAST_TRAIN_ARGS=$(echo "$TRAIN_ARGS" \
+              | sed "s|--data-dir ${DATA_DIR}|--data-dir ${VAST_DATA_DIR}|" \
+              | sed "s|--math-data-dir ${MATH_DATA_DIR}|--math-data-dir ${VAST_MATH_DATA_DIR}|" \
+              | sed "s|--output-dir ${output_dir}|--output-dir ${VAST_OUTPUT_DIR}|" \
+              | sed "s|--save-steps ${SAVE_STEPS}|--save-steps 9999|")
+
+            echo "Launching ${job_name} on vast.ai (${VAST_SSH_HOST}:${VAST_SSH_PORT})..."
+            ssh -p ${VAST_SSH_PORT} ${VAST_SSH_USER}@${VAST_SSH_HOST} \
+              "cd ${VAST_REMOTE_DIR} && nohup bash vast_launch.sh '${job_name}' '${VAST_OUTPUT_DIR}' \
+              ${VAST_TRAIN_ARGS} \
+              > /dev/null 2>&1 &" &
+            echo "  Job submitted in background (check vast.ai instance for logs)"
+
+          else
+            # =========================================================
+            # SLURM: Submit to school cluster (default)
+            # =========================================================
+            sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=${job_name}
 #SBATCH --account=${ACCOUNT}
@@ -408,64 +536,9 @@ accelerate launch \\
   --mixed_precision=no \\
   train_controller_standalone.py \\
   --model-path ${MODEL_PATH} \\
-  --data-dir ${DATA_DIR} \\
-  --dataset-type ${DATASET_TYPE} \\
-  --data-categories "${DATA_CATEGORIES}" \\
-  --math-data-dir ${MATH_DATA_DIR} \\
-  --math-split ${MATH_SPLIT} \\
-  --correctness-reward-alpha ${corr_alpha} \\
-  --output-dir ${output_dir} \\
-  --controller-allowed-experts ${experts} \\
-  --prompts-per-category ${PROMPTS_PER_CATEGORY} \\
-  --max-prompt-length ${MAX_PROMPT_LENGTH} \\
-  --num-rollouts-per-prompt ${NUM_ROLLOUTS_PER_PROMPT} \\
-  --response-length ${resp_len} \\
-  --token-temperature ${TOKEN_TEMPERATURE} \\
-  --learning-rate ${lr} \\
-  --latency-cost ${latency} \\
-  --per-device-train-batch ${per_device_batch} \\
-  --gradient-accumulation ${grad_acc} \\
-  --num-train-epochs ${NUM_TRAIN_EPOCHS} \\
-  --num-update-epochs ${NUM_UPDATE_EPOCHS} \\
-  --value-coef ${value_coef} \\
-  --entropy-coef ${entropy_coef} \\
-  --seed ${SEED} \\
-  --kl-reward-scale ${KL_REWARD_SCALE} \\
-  --logging-steps ${LOGGING_STEPS} \\
-  --save-steps ${SAVE_STEPS} \\
-  --switch-init-bias ${switch_bias} \\
-  --controller-hidden-dim ${hidden_dim} \\
-  --controller-expert-embed-dim ${expert_embed_dim} \\
-  --controller-layer-norm ${layer_norm} \\
-  --controller-input-type ${input_type} \\
-  --deliberation-cost ${delib_cost} \\
-  --gamma ${gamma} \\
-  --gae-lambda ${GAE_LAMBDA} \\
-  --controller-type ${CONTROLLER_TYPE} \\
-  --activation-controller-mlp-hidden ${ACTIVATION_MLP_HIDDEN} \\
-  --intra-option-update ${INTRA_OPTION_UPDATE} \\
-  --intra-option-lr ${intra_lr} \\
-  --intra-option-warmup-steps ${INTRA_OPTION_WARMUP_STEPS} \\
-  --intra-option-q-baseline ${q_baseline} \\
-  --lora-r ${lora_r} \\
-  --lora-alpha ${LORA_ALPHA} \\
-  --selection-epsilon ${sel_eps} \\
-  ${SELECTION_EPSILON_ANNEAL_ARGS} \\
-  --term-adv-rms-norm ${term_rms} \\
-  --q-based-selection ${q_based} \\
-  --q-selection-steps ${Q_SELECTION_STEPS} \\
-  --q-selection-lr ${Q_SELECTION_LR} \\
-  --q-selection-epsilon ${q_sel_eps} \\
-  ${Q_SELECTION_EPSILON_ANNEAL_ARGS} \\
-  --q-selection-debug ${Q_SELECTION_DEBUG} \\
-  --q-selection-init-w ${q_init_w} \\
-  --repetition-penalty-c ${rep_c} \\
-  --repetition-penalty-decay ${rep_decay} \\
-  --term-topk-lambda ${term_topk_lambda} \\
-  --term-topk-k ${term_topk_k} \\
-  --teacher-mix-alpha ${teach_alpha} \\
-  ${RESUME_FLAG}
+  ${TRAIN_ARGS}
 EOF
+          fi
 
                                                       done
                                                     done

@@ -457,6 +457,19 @@ class GptOssControllerLayerState:
     current_expert_indices: Optional[torch.Tensor] = None  # Current option/expert set (for activation controller)
 
 
+@dataclass
+class GptOssJointOptionState:
+    """State for the joint (shared) option across all layers.
+    
+    In joint-option mode, a single option covers all layers simultaneously.
+    The option is a concatenation of per-layer expert index sets: [num_moe_layers, k].
+    Termination/V/Q decisions are made once per token using the last layer's
+    post-MLP hidden state, while expert selection heads remain per-layer.
+    """
+    current_expert_indices_all: Optional[torch.Tensor] = None  # [batch, num_moe_layers, k]
+    last_layer_hidden: Optional[torch.Tensor] = None  # [batch, hidden_size] - post-MLP of last layer from prev token
+
+
 class GptOssRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -1122,6 +1135,206 @@ class GptOssActivationController(nn.Module):
         # print(f"[DEBUG-Q_OPTION-ACT] s_normed norm: {s_normed.norm(dim=-1).mean().item():.6f}")
         
         # Return float32 for numerical stability
+        return q_u.float()
+
+
+class GptOssJointOptionController(nn.Module):
+    """
+    Joint (shared) option controller across all MoE layers.
+    
+    A single option covers all layers simultaneously. The option is represented
+    as a joint expert selection across all MoE layers.
+    
+    Architecture:
+        - Termination head: MLP(concat(h_last, s_joint)) -> switch_logit (single decision)
+        - Selection heads: per-layer Linear(h_layer) -> expert_logits (one per MoE layer)
+        - V head: Linear(h_last) -> value (single state value)
+        - Q head: MLP(concat(h_last, s_joint)) -> Q_U(s, joint_option)
+    
+    Where:
+        h_last = last layer's post-MLP hidden state
+        h_layer = per-layer pre-MLP hidden state (for selection heads only)
+        s_joint = DeepSets embedding of the joint expert set across all layers
+    """
+    def __init__(self, config: GptOssConfig, moe_layer_indices: list, router_weights: dict = None, router_biases: dict = None):
+        """
+        Args:
+            config: Model config
+            moe_layer_indices: List of layer indices that have MoE (e.g., [0, 1, ..., 23])
+            router_weights: Dict[layer_idx -> weight tensor] for initializing per-layer selection heads
+            router_biases: Dict[layer_idx -> bias tensor] for initializing per-layer selection heads
+        """
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.moe_layer_indices = sorted(moe_layer_indices)
+        self.num_moe_layers = len(self.moe_layer_indices)
+        self.total_experts = self.num_moe_layers * self.num_experts  # e.g., 24 * 32 = 768
+        
+        self.expert_set_embed_dim = getattr(config, "controller_expert_embed_dim", 128)
+        
+        # Joint set embedding output dimension (configurable, default = total_experts * 4)
+        self.joint_set_embed_dim = getattr(config, "joint_set_embed_dim", self.total_experts * 4)
+        
+        self.mlp_hidden_dim = getattr(config, "joint_controller_mlp_hidden", 4096)
+        
+        # DeepSets for JOINT expert set embedding across all layers
+        # Each expert is uniquely identified by (layer_position, expert_id)
+        # Embedding table: total_experts entries, one per (layer, expert) pair
+        self.expert_embedding = nn.Embedding(self.total_experts, self.expert_set_embed_dim)
+        self.deepsets_phi = nn.Sequential(
+            nn.Linear(self.expert_set_embed_dim, self.joint_set_embed_dim),
+            nn.GELU(),
+            nn.Linear(self.joint_set_embed_dim, self.joint_set_embed_dim),
+        )
+        
+        # Termination head: MLP(concat(h_last, s_joint)) -> switch_logit
+        term_input_dim = self.hidden_size + self.joint_set_embed_dim
+        self.termination_head = nn.Sequential(
+            nn.Linear(term_input_dim, self.mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_dim, 1)
+        )
+        switch_init_bias = getattr(config, "switch_init_bias", -3.0)
+        with torch.no_grad():
+            self.termination_head[2].weight.mul_(0.01)
+            self.termination_head[2].bias.fill_(switch_init_bias)
+        
+        # Per-layer selection heads: Linear(h_layer) -> expert_logits
+        # Each initialized from the corresponding layer's router weights
+        self.selection_heads = nn.ModuleDict()
+        for layer_idx in self.moe_layer_indices:
+            head = nn.Linear(self.hidden_size, self.num_experts)
+            if router_weights is not None and layer_idx in router_weights:
+                with torch.no_grad():
+                    head.weight.copy_(router_weights[layer_idx])
+            if router_biases is not None and layer_idx in router_biases:
+                with torch.no_grad():
+                    head.bias.copy_(router_biases[layer_idx])
+            self.selection_heads[str(layer_idx)] = head
+        
+        # V head: Linear(h_last) -> value
+        self.value_head = nn.Linear(self.hidden_size, 1)
+        with torch.no_grad():
+            self.value_head.weight.mul_(0.01)
+            self.value_head.bias.zero_()
+        
+        # Q head: MLP(concat(h_last, s_joint)) -> Q_U(s, joint_option)
+        q_input_dim = self.hidden_size + self.joint_set_embed_dim
+        self.q_head = nn.Sequential(
+            nn.Linear(q_input_dim, self.mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_dim, 1)
+        )
+        with torch.no_grad():
+            self.q_head[2].weight.mul_(0.01)
+            self.q_head[2].bias.zero_()
+        
+        # RMSNorm for input normalization
+        self.h_rms_norm = GptOssRMSNorm(self.hidden_size)
+        self.set_repr_rms_norm = GptOssRMSNorm(self.joint_set_embed_dim)
+        
+        # Build mapping from layer_idx to position index (0-based) for embedding lookup
+        self._layer_idx_to_pos = {idx: pos for pos, idx in enumerate(self.moe_layer_indices)}
+    
+    def _compute_joint_set_embedding(
+        self,
+        all_layer_indices: torch.Tensor,  # [batch, num_moe_layers, k]
+        target_dtype: torch.dtype = None,
+    ) -> torch.Tensor:
+        """
+        Compute DeepSets embedding for the joint expert set across all layers.
+        
+        Args:
+            all_layer_indices: [batch, num_moe_layers, k] expert indices per layer
+            target_dtype: Target dtype for computation
+            
+        Returns:
+            set_repr: [batch, joint_set_embed_dim] joint set embedding
+        """
+        if target_dtype is None:
+            target_dtype = self.deepsets_phi[0].weight.dtype
+        
+        batch_size, num_layers, k = all_layer_indices.shape
+        
+        # Convert per-layer expert indices to global indices:
+        # global_idx = layer_position * num_experts + expert_idx
+        layer_offsets = torch.arange(num_layers, device=all_layer_indices.device).view(1, -1, 1) * self.num_experts
+        
+        valid_mask = all_layer_indices >= 0
+        safe_indices = all_layer_indices.clamp(min=0, max=self.num_experts - 1)
+        global_indices = safe_indices + layer_offsets
+        global_indices = global_indices.clamp(max=self.total_experts - 1)
+        
+        # Flatten to [batch, num_layers * k] for embedding lookup
+        flat_indices = global_indices.view(batch_size, -1)
+        flat_valid = valid_mask.view(batch_size, -1)
+        
+        expert_embeds = self.expert_embedding(flat_indices)  # [batch, num_layers*k, embed_dim]
+        expert_embeds = expert_embeds.to(dtype=target_dtype)
+        expert_embeds = expert_embeds * flat_valid.unsqueeze(-1).to(dtype=target_dtype)
+        
+        transformed = self.deepsets_phi(expert_embeds)  # [batch, num_layers*k, joint_set_embed_dim]
+        
+        num_valid = flat_valid.sum(dim=1, keepdim=True).clamp(min=1).to(dtype=target_dtype)
+        set_repr = transformed.sum(dim=1) / num_valid  # [batch, joint_set_embed_dim]
+        
+        return set_repr
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # Last layer post-MLP hidden [batch, hidden_size]
+        all_layer_indices: torch.Tensor,  # [batch, num_moe_layers, k] current joint option
+    ) -> tuple:
+        """
+        Forward pass for joint option controller (termination + V only).
+        
+        Returns:
+            switch_logits: [batch,]
+            value: V(s), [batch,]
+            set_embedding: [batch, joint_set_embed_dim]
+        """
+        target_dtype = self.termination_head[0].weight.dtype
+        h = hidden_states.to(dtype=target_dtype)
+        
+        s = self._compute_joint_set_embedding(all_layer_indices, target_dtype=target_dtype)
+        
+        h_normed = self.h_rms_norm(h)
+        s_normed = self.set_repr_rms_norm(s)
+        term_input = torch.cat([h_normed, s_normed], dim=-1)
+        switch_logits = self.termination_head(term_input).squeeze(-1)
+        
+        value = self.value_head(h_normed).squeeze(-1)
+        
+        return switch_logits.float(), value.float(), s.float()
+    
+    def compute_selection_logits(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,  # Per-layer pre-MLP hidden [batch, hidden_size]
+    ) -> torch.Tensor:
+        """Compute expert selection logits for a specific layer."""
+        head = self.selection_heads[str(layer_idx)]
+        target_dtype = head.weight.dtype
+        h = hidden_states.to(dtype=target_dtype)
+        logits = head(h)
+        return logits.float()
+    
+    def compute_q_option(
+        self,
+        hidden_states: torch.Tensor,  # Last layer post-MLP hidden [batch, hidden_size]
+        all_layer_indices: torch.Tensor,  # [batch, num_moe_layers, k]
+    ) -> torch.Tensor:
+        """Compute Q_U(s, joint_option)."""
+        target_dtype = self.q_head[0].weight.dtype
+        h = hidden_states.to(dtype=target_dtype)
+        s = self._compute_joint_set_embedding(all_layer_indices, target_dtype=target_dtype)
+        
+        h_normed = self.h_rms_norm(h)
+        s_normed = self.set_repr_rms_norm(s)
+        q_input = torch.cat([h_normed, s_normed], dim=-1)
+        q_u = self.q_head(q_input).squeeze(-1)
+        
         return q_u.float()
 
 
@@ -1805,6 +2018,66 @@ class GptOssMLP(nn.Module):
         # Just delegate to forward - they should behave the same
         return self.forward(hidden_states, controller_state, controller_runtime)
 
+    def forward_joint_option(
+        self,
+        hidden_states: torch.Tensor,  # [batch, seq_len, hidden_size] - pre-MLP hidden states
+        allowed_mask: torch.Tensor,  # [batch, num_experts] or [batch, seq_len, num_experts]
+        controller_runtime=None,
+    ):
+        """
+        Forward pass in joint-option mode: the allowed_mask is provided externally
+        by the joint controller. No per-layer controller logic runs here.
+        
+        Records router_logits and pre-MLP hidden states for the joint controller
+        to use in loss computation.
+        
+        allowed_mask can be:
+          - [batch, num_experts]: same mask for all tokens (generation, single token)
+          - [batch, seq_len, num_experts]: per-token masks (replay forward pass)
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        router_logits = self.router.compute_router_logits(hidden_states).view(batch_size, seq_len, -1)
+        
+        layer_idx = getattr(self, "layer_idx", None)
+        record_actions = _runtime_get(controller_runtime, "record_actions", None)
+        
+        # allowed_mask: [batch, num_experts] → expand, or [batch, seq_len, num_experts] → use directly
+        if allowed_mask.dim() == 2:
+            mask_expanded = allowed_mask.unsqueeze(1).expand(-1, seq_len, -1)
+        else:
+            mask_expanded = allowed_mask
+        masked_logits = router_logits.masked_fill(~mask_expanded, torch.finfo(router_logits.dtype).min)
+        
+        # Standard routing with masked logits
+        masked_logits_flat = masked_logits.reshape(batch_size * seq_len, -1)
+        top_values, top_indices = torch.topk(masked_logits_flat, self.router.top_k, dim=-1)
+        top_probs = torch.nn.functional.softmax(top_values, dim=-1, dtype=top_values.dtype)
+        dense_router_scores = masked_logits_flat.new_zeros(masked_logits_flat.shape)
+        dense_router_scores.scatter_(1, top_indices, top_probs)
+        stacked_scores = dense_router_scores.view(batch_size, seq_len, -1)
+        stacked_indices = top_indices.view(batch_size, seq_len, -1)
+        routed_out = self._route_experts(
+            hidden_states,
+            stacked_indices.view(-1, self.router.top_k),
+            stacked_scores.view(-1, self.router.num_experts),
+            routing_data=stacked_scores.view(-1, self.router.num_experts),
+        )
+        
+        # Record traces for joint controller loss computation
+        if record_actions is not None and layer_idx is not None:
+            new_record = {
+                "router_logits": router_logits.detach().clone(),
+                "llm_hidden_states": hidden_states.detach().clone(),
+            }
+            if layer_idx in record_actions:
+                prev_record = record_actions[layer_idx]
+                new_record = {
+                    key: torch.cat([prev_record[key], value], dim=1) for key, value in new_record.items()
+                }
+            record_actions[layer_idx] = new_record
+        
+        return routed_out, stacked_scores.view(-1, self.router.num_experts)
+
 class GptOssRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -2000,6 +2273,7 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         controller_state: Optional[GptOssControllerLayerState] = None,
         controller_runtime=None,
+        joint_option_mask: Optional[torch.Tensor] = None,  # [batch, num_experts] for joint option mode
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, Optional[GptOssControllerLayerState]]:
         residual = hidden_states
@@ -2020,22 +2294,32 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        controller_enabled = getattr(self.mlp, "controller_enabled", False)
-        experts = getattr(self.mlp, "experts", None)
-        experts_cls_name = experts.__class__.__name__ if experts is not None else ""
-        uses_mxfp4 = experts_cls_name == "Mxfp4GptOssExperts"
-        if controller_enabled and not uses_mxfp4:
-            hidden_states, _, next_controller_state = self.mlp.forward_controller(
+        
+        if joint_option_mask is not None:
+            # Joint option mode: mask is provided externally by joint controller
+            hidden_states, _ = self.mlp.forward_joint_option(
                 hidden_states,
-                controller_state=controller_state,
+                allowed_mask=joint_option_mask,
                 controller_runtime=controller_runtime,
-            )  # diff with llama: router scores
+            )
+            next_controller_state = None
         else:
-            hidden_states, _, next_controller_state = self.mlp(
-                hidden_states,
-                controller_state=controller_state,
-                controller_runtime=controller_runtime,
-            )  # diff with llama: router scores
+            controller_enabled = getattr(self.mlp, "controller_enabled", False)
+            experts = getattr(self.mlp, "experts", None)
+            experts_cls_name = experts.__class__.__name__ if experts is not None else ""
+            uses_mxfp4 = experts_cls_name == "Mxfp4GptOssExperts"
+            if controller_enabled and not uses_mxfp4:
+                hidden_states, _, next_controller_state = self.mlp.forward_controller(
+                    hidden_states,
+                    controller_state=controller_state,
+                    controller_runtime=controller_runtime,
+                )  # diff with llama: router scores
+            else:
+                hidden_states, _, next_controller_state = self.mlp(
+                    hidden_states,
+                    controller_state=controller_state,
+                    controller_runtime=controller_runtime,
+                )  # diff with llama: router scores
         hidden_states = residual + hidden_states
         return hidden_states, next_controller_state
 
@@ -2317,8 +2601,17 @@ class GptOssModel(GptOssPreTrainedModel):
             controller_states = [None] * len(self.layers)
         next_controller_states: list[Optional[GptOssControllerLayerState]] = []
 
+        # Joint option mode: masks are provided externally per layer
+        joint_option_masks = _runtime_get(controller_runtime, "joint_option_masks", None) if controller_runtime is not None else None
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             layer_controller_state = controller_states[layer_idx] if controller_states else None
+            
+            # In joint option mode, pass the per-layer mask instead of per-layer controller state
+            layer_joint_mask = None
+            if joint_option_masks is not None and layer_idx in joint_option_masks:
+                layer_joint_mask = joint_option_masks[layer_idx]
+            
             hidden_states, updated_controller_state = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -2329,10 +2622,26 @@ class GptOssModel(GptOssPreTrainedModel):
                 position_embeddings=position_embeddings,
                 controller_state=layer_controller_state,
                 controller_runtime=controller_runtime,
+                joint_option_mask=layer_joint_mask,
                 **kwargs,
             )
             next_controller_states.append(updated_controller_state)
+        
+        # Record last layer's post-MLP hidden state (before final RMSNorm) for joint controller
+        # This is the output of the last decoder layer with all residual connections applied
+        if controller_runtime is not None and _runtime_get(controller_runtime, "joint_option_mode", False):
+            record_actions = _runtime_get(controller_runtime, "record_actions", None)
+            if record_actions is not None:
+                last_layer_hidden_key = "_last_layer_post_mlp_hidden"
+                if last_layer_hidden_key in record_actions:
+                    record_actions[last_layer_hidden_key] = torch.cat(
+                        [record_actions[last_layer_hidden_key], hidden_states.detach().clone()], dim=1
+                    )
+                else:
+                    record_actions[last_layer_hidden_key] = hidden_states.detach().clone()
+        
         hidden_states = self.norm(hidden_states)
+        
         outputs = MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,

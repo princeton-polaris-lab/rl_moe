@@ -29,7 +29,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 
 # OpenAI API key for GPT-5 judge
-export OPENAI_API_KEY="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"
+export OPENAI_API_KEY="YOUR_API_KEY_HERE"
 
 # Run the training script with DeepSpeed via accelerate
 echo "Starting Controller Training with DeepSpeed..."

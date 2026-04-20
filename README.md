@@ -1,26 +1,25 @@
-# RL-MoE: Reinforcement Learning for Mixture-of-Experts Controller Training
+# Temporally Extended Mixture-of-Experts Models
 
-This repository implements controller training for Mixture-of-Experts (MoE) models using reinforcement learning, specifically the **Option-Critic** algorithm.
+This repository implements **temporally extended MoE** controller training using the **Option-Critic** framework with deliberation costs. A lightweight per-layer controller learns when to switch expert sets and which to load, reducing switch rates from >50% to under 5% while retaining up to ~90% of base-model accuracy.
+
+**Paper:** [Temporally Extended Mixture-of-Experts Models](https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf)
+
+**Project Page:** Coming soon
 
 ## Features
 
-- **RNN-based Controller**: Uses a GRU to maintain hidden state across tokens for expert selection
 - **Activation-based Controller**: Uses LLM hidden states directly with DeepSets for expert selection
-- **Multiple Reward Functions**: KL divergence, perplexity-based rewards
-- **Distributed Training**: Support for DeepSpeed and accelerate
+- **Option-Critic with Deliberation Costs**: Learns when to switch expert sets via termination, value, and Plackett-Luce selection heads
+- **Self-Distillation Reward**: Per-token reverse KL between frozen teacher and controller-augmented student
+- **Distributed Training**: Support for DeepSpeed and Accelerate
 
 ## Installation
 
 ### 1. Create Python Environment
 
 ```bash
-# Using conda
 conda create -n rl_moe python=3.11
 conda activate rl_moe
-
-# Or using venv
-python -m venv venv
-source venv/bin/activate
 ```
 
 ### 2. Install Dependencies
@@ -51,56 +50,86 @@ Or specify a custom environment path:
 Use the launch script for grid search:
 
 ```bash
-# Edit launch_grid.sh to configure hyperparameters
-bash launch_grid.sh
+# Edit launch_grid_activation.sh to configure hyperparameters
+bash launch_grid_activation.sh
 ```
 
-Or run directly:
+Or run directly via accelerate:
 
 ```bash
-python train_controller_standalone.py \
-    --model_name /path/to/gpt-oss-20b \
-    --learning_rate 1e-3 \
-    --per_prompt_generation 16 \
-    --grad_accum_steps 2 \
+accelerate launch \
+    --config_file accelerate_config.yaml \
+    --mixed_precision=no \
+    train_controller_standalone.py \
+    --controller_type activation \
     --controller_allowed_experts 16 \
+    --deliberation_cost 0.02 \
     --reward_type kl \
-    --algorithm option_critic \
-    --controller_type rnn  # or "activation"
+    --response-length 512 \
+    --logging-steps 1 \
+    --save-steps 20
 ```
-
-### Controller Types
-
-- **`rnn`**: RNN-based controller (GRU hidden state)
-- **`activation`**: Activation-based controller (uses LLM hidden states)
 
 ### Key Hyperparameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--learning_rate` | Controller learning rate | 1e-3 |
-| `--per_prompt_generation` | Batch size per prompt | 16 |
-| `--grad_accum_steps` | Gradient accumulation steps | 2 |
-| `--controller_allowed_experts` | Number of experts to allow | 16 |
-| `--switch_init_bias` | Initial bias for switch probability | -3.0 |
-| `--deliberation_cost` | Cost for switching experts | 0.001 |
-| `--reward_type` | Reward function (kl, perplexity) | kl |
+| `--controller_type` | Controller type (`activation`) | activation |
+| `--controller_allowed_experts` | Number of experts in the mask ($k_{\text{mask}}$) | 16 |
+| `--deliberation_cost` | Cost for switching experts ($\eta$) | 0.02 |
+| `--reward_type` | Reward function (`kl`) | kl |
+| `--with_lora` | Enable LoRA adapters on experts and attention | flag |
+
+### Evaluation
+
+Evaluation scripts are in the `eval/` directory:
+
+```bash
+# Evaluate controller on MATH
+python eval/eval_math.py --checkpoint-dir /path/to/checkpoint --step 120 --controller-type activation
+
+# Evaluate controller on MMLU/MMMLU
+python eval/eval_mmlu_controller.py --checkpoint-dir /path/to/checkpoint --step 120 --controller-type activation
+
+# Evaluate pruning baselines on MMLU/MMMLU
+python eval/eval_mmlu_baseline.py --method frequency --num-experts 16
+```
 
 ## Project Structure
 
 ```
 rl_moe/
-├── train_controller_standalone.py  # Main training script
-├── controller_trainer.py           # RNN controller trainer
-├── activation_controller_trainer.py # Activation controller trainer
-├── launch_grid.sh                  # SLURM job submission script
-├── transformers_patches/           # Custom transformers modifications
+├── train_controller_standalone.py    # Main training entrypoint
+├── activation_controller_trainer.py  # Activation-based controller trainer
+├── launch_grid_activation.sh         # SLURM grid search launcher
+├── run_controller.slurm              # Single-job SLURM script
+├── accelerate_config.yaml            # Accelerate distributed config
+├── deepspeed_config.json             # DeepSpeed config (referenced by accelerate)
+├── transformers_patches/             # Custom transformers modifications
 │   ├── models/gpt_oss/
-│   │   ├── modeling_gpt_oss.py     # MoE model with controller support
-│   │   └── configuration_gpt_oss.py
-│   └── integrations/
-│       └── mxfp4.py                # Optimized MoE kernel
+│   │   ├── modeling_gpt_oss.py       # MoE model with controller hooks
+│   │   ├── configuration_gpt_oss.py
+│   │   └── __init__.py
+│   ├── integrations/
+│   │   └── mxfp4.py
+│   ├── modeling_outputs.py
+│   └── generation/
+│       └── utils.py
+├── eval/
+│   ├── eval_math.py                  # MATH benchmark evaluation
+│   ├── eval_mmlu_controller.py       # MMLU/MMMLU evaluation with controller
+│   └── eval_mmlu_baseline.py         # MMLU/MMMLU evaluation for baselines
 ├── requirements.txt
-├── install.sh                      # Patch installation script
+├── install.sh                        # Patch installation script
 └── README.md
+```
+
+## Citation
+
+```bibtex
+@article{shen2026temoe,
+  title  = {Temporally Extended Mixture-of-Experts Models},
+  author = {Shen, Zeyu and Henderson, Peter},
+  year   = {2026}
+}
 ```

@@ -158,37 +158,109 @@ class ActivationControllerTrainer:
         # Get references to the model's built-in activation controllers
         self.activation_controllers = self._get_model_activation_controllers()
         
-        # =========================================================================
-        # Convert activation controller parameters to float32 AFTER model loading
-        # This is critical because:
-        # - from_pretrained(..., torch_dtype=bfloat16) loads ALL weights in bfloat16
-        # - bfloat16 has only 7 bits of mantissa, giving precision of ~0.02 at magnitude 3.0
-        # - Small gradient updates (e.g., lr=1e-3 * grad=1e-3 = 1e-6) get rounded to 0
-        # =========================================================================
-        if accelerator.is_main_process:
-            sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
-            print(f"[INIT] Activation controller dtype BEFORE conversion: {sample_param.dtype}")
+        # Joint option mode: create a single shared controller across all layers
+        self.joint_option = getattr(config, 'joint_option', False)
+        self.joint_controller = None
         
-        self._convert_activation_controllers_to_fp32()
-        
-        if accelerator.is_main_process:
-            sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
-            print(f"[INIT] Activation controller dtype AFTER conversion: {sample_param.dtype}")
-        
-        # Explicitly initialize switch/termination head bias (like original ControllerTrainer)
-        self._initialize_termination_bias(config.switch_init_bias)
-        
-        # Create optimizer for activation controllers
-        self.controller_params = self._get_activation_controller_params()
-        if accelerator.is_main_process:
-            num_params = sum(p.numel() for p in self.controller_params)
-            print(f"[INIT] Activation controller parameters: {num_params:,}")
-        
-        self.optimizer = torch.optim.AdamW(
-            self.controller_params,
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
+        if self.joint_option:
+            if accelerator.is_main_process:
+                print(f"[INIT] Joint option mode enabled - creating shared controller across {len(self.activation_controllers)} layers")
+            
+            from transformers.models.gpt_oss.modeling_gpt_oss import GptOssJointOptionController
+            
+            # Collect router weights/biases from each MoE layer for selection head init
+            moe_layers = self._get_moe_layers()
+            router_weights = {}
+            router_biases = {}
+            for layer_idx, mlp in moe_layers.items():
+                router_weights[layer_idx] = mlp.router.weight.data.clone()
+                if mlp.router.bias is not None:
+                    router_biases[layer_idx] = mlp.router.bias.data.clone()
+            
+            # Get the model config
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            policy = unwrapped.policy if hasattr(unwrapped, 'policy') else unwrapped
+            if hasattr(policy, 'base_model') and hasattr(policy.base_model, 'model'):
+                model_config = policy.base_model.model.config
+            else:
+                model_config = policy.config
+            
+            # Set joint option config on model config so the controller picks it up
+            model_config.joint_set_embed_dim = getattr(config, 'joint_set_embed_dim', 3072)
+            model_config.joint_controller_mlp_hidden = getattr(config, 'joint_controller_mlp_hidden', 4096)
+            
+            self.joint_controller = GptOssJointOptionController(
+                config=model_config,
+                moe_layer_indices=sorted(self.activation_controllers.keys()),
+                router_weights=router_weights,
+                router_biases=router_biases,
+            )
+            
+            # Move to same device as model
+            device = next(iter(self.activation_controllers.values())).termination_head[0].weight.device
+            self.joint_controller = self.joint_controller.to(device)
+            
+            # Convert to float32
+            for param in self.joint_controller.parameters():
+                param.data = param.data.float()
+            
+            if accelerator.is_main_process:
+                num_joint_params = sum(p.numel() for p in self.joint_controller.parameters())
+                print(f"[INIT] Joint controller parameters: {num_joint_params:,}")
+                print(f"[INIT] Joint controller total_experts: {self.joint_controller.total_experts}")
+                print(f"[INIT] Joint controller joint_set_embed_dim: {self.joint_controller.joint_set_embed_dim}")
+            
+            # Initialize termination bias on joint controller
+            import math as _math
+            with torch.no_grad():
+                last_layer = self.joint_controller.termination_head[2]
+                nn.init.xavier_uniform_(last_layer.weight)
+                last_layer.weight.mul_(0.01)
+                last_layer.bias.fill_(config.switch_init_bias)
+            if accelerator.is_main_process:
+                expected_switch_prob = 1.0 / (1.0 + _math.exp(-config.switch_init_bias))
+                print(f"[INIT] Joint controller termination bias: {config.switch_init_bias:.2f} (switch prob: {expected_switch_prob:.4f})")
+            
+            # Optimizer for joint controller only (per-layer controllers are NOT trained)
+            self.controller_params = list(self.joint_controller.parameters())
+            if accelerator.is_main_process:
+                num_params = sum(p.numel() for p in self.controller_params)
+                print(f"[INIT] Joint controller optimizer parameters: {num_params:,}")
+            
+            self.optimizer = torch.optim.AdamW(
+                self.controller_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+        else:
+            # Per-layer mode (original behavior)
+            # =========================================================================
+            # Convert activation controller parameters to float32 AFTER model loading
+            # =========================================================================
+            if accelerator.is_main_process:
+                sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
+                print(f"[INIT] Activation controller dtype BEFORE conversion: {sample_param.dtype}")
+            
+            self._convert_activation_controllers_to_fp32()
+            
+            if accelerator.is_main_process:
+                sample_param = next(iter(self.activation_controllers.values())).termination_head[0].weight
+                print(f"[INIT] Activation controller dtype AFTER conversion: {sample_param.dtype}")
+            
+            # Explicitly initialize switch/termination head bias (like original ControllerTrainer)
+            self._initialize_termination_bias(config.switch_init_bias)
+            
+            # Create optimizer for activation controllers
+            self.controller_params = self._get_activation_controller_params()
+            if accelerator.is_main_process:
+                num_params = sum(p.numel() for p in self.controller_params)
+                print(f"[INIT] Activation controller parameters: {num_params:,}")
+            
+            self.optimizer = torch.optim.AdamW(
+                self.controller_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
         
         # =====================================================================
         # Intra-option policy update: LoRA on experts + trainable router
@@ -685,36 +757,212 @@ class ActivationControllerTrainer:
             print(f"  [TEACHER-MIX] Starting generation with α={teacher_mix_alpha}, temp={temperature}", flush=True)
             print(f"  [TEACHER-MIX] Using dual KV-cache approach (O(n) complexity)", flush=True)
         
+        # Joint option state management
+        joint_option_state = None
+        joint_moe_layers = None
+        joint_k_experts = None
+        if self.joint_option and self.joint_controller is not None:
+            from transformers.models.gpt_oss.modeling_gpt_oss import GptOssJointOptionState, _mixed_policy_sample
+            joint_option_state = GptOssJointOptionState()
+            # Cache MoE layer info BEFORE disabling controllers
+            # (_get_moe_layers filters by controller_enabled, so must be called first)
+            joint_moe_layers = self._get_moe_layers()
+            joint_k_experts = next(iter(joint_moe_layers.values())).controller_allowed_experts
+            # Now disable per-layer controllers - we manage routing externally
+            self._set_controller_enabled(policy, False)
+            if self.accelerator.is_main_process:
+                print(f"  [TEACHER-MIX] Joint option mode: per-layer controllers disabled, k_experts={joint_k_experts}", flush=True)
+        
+        # =====================================================================
+        # Joint option mode: sequential prefill for tokens 0..query_len-2.
+        # We process all but the LAST query token here. The last query token
+        # is left for the generation loop's first iteration, which processes
+        # it through both student and teacher to get logits for the first
+        # generated token — exactly the same as the non-joint path.
+        # =====================================================================
+        joint_mode = (self.joint_option and self.joint_controller is not None)
+        
+        if joint_mode and query_len > 1:
+            moe_layer_indices = self.joint_controller.moe_layer_indices
+            num_experts = self.joint_controller.num_experts
+            k_experts = joint_k_experts
+            num_moe_layers = len(moe_layer_indices)
+            selection_epsilon = controller_runtime.get("selection_epsilon", self._get_current_epsilon())
+            
+            # Collect per-token option indices during prefill for accurate replay
+            # Each entry is [batch, num_moe_layers, k] — the option used at that prefill token
+            # None means vanilla routing (no mask) was used (q_idx=0 before option init)
+            prefill_option_list = []
+            
+            if self.accelerator.is_main_process:
+                print(f"  [TEACHER-MIX] Sequential prefill for {query_len - 1} query tokens (last token deferred to gen loop)", flush=True)
+            
+            for q_idx in range(query_len - 1):
+                prefill_token = current_ids[:, q_idx:q_idx+1]  # [batch, 1]
+                if student_past_kv is None:
+                    prefill_position_ids = None
+                else:
+                    prefill_position_ids = torch.tensor([[q_idx]], device=device).expand(batch_size, 1)
+                prefill_attn_mask = (current_ids[:, :q_idx+1] != pad_token_id).long()
+                
+                prefill_runtime = {
+                    "record_actions": {},
+                    "sampling": True,
+                    "selection_epsilon": selection_epsilon,
+                    "joint_option_mode": True,
+                }
+                
+                if joint_option_state.current_expert_indices_all is not None:
+                    joint_masks = {}
+                    for pos, layer_idx in enumerate(moe_layer_indices):
+                        layer_indices = joint_option_state.current_expert_indices_all[:, pos, :]
+                        mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
+                        mask.scatter_(1, layer_indices, True)
+                        joint_masks[layer_idx] = mask
+                    prefill_runtime["joint_option_masks"] = joint_masks
+                    prefill_option_list.append(joint_option_state.current_expert_indices_all.detach().clone())
+                else:
+                    # q_idx=0: no option yet, vanilla routing — record None placeholder
+                    prefill_option_list.append(None)
+                
+                prefill_out = policy(
+                    input_ids=prefill_token,
+                    attention_mask=prefill_attn_mask,
+                    position_ids=prefill_position_ids,
+                    past_key_values=student_past_kv,
+                    use_cache=True,
+                    controller_runtime=prefill_runtime,
+                    controller_states=student_controller_states,
+                )
+                student_past_kv = prefill_out.past_key_values
+                student_controller_states = getattr(prefill_out, 'controller_states', None)
+                
+                prefill_actions = prefill_runtime.get("record_actions", {})
+                last_layer_hidden = prefill_actions.get("_last_layer_post_mlp_hidden", None)
+                last_layer_hidden_t = last_layer_hidden[:, -1, :] if last_layer_hidden is not None else None
+                
+                if joint_option_state.current_expert_indices_all is None:
+                    # q_idx=0: init from router top-k
+                    all_indices = []
+                    for pos, layer_idx in enumerate(moe_layer_indices):
+                        layer_data = prefill_actions.get(layer_idx, {})
+                        layer_router_logits = layer_data.get("router_logits", None)
+                        if layer_router_logits is not None:
+                            top_k_indices = torch.topk(layer_router_logits[:, -1, :], k_experts, dim=-1).indices
+                        else:
+                            top_k_indices = torch.zeros(batch_size, k_experts, dtype=torch.long, device=device)
+                        all_indices.append(top_k_indices)
+                    joint_option_state.current_expert_indices_all = torch.stack(all_indices, dim=1)
+                    joint_option_state.last_layer_hidden = last_layer_hidden_t
+                else:
+                    # q_idx > 0: termination/selection decision
+                    h_for_decision = joint_option_state.last_layer_hidden
+                    current_all = joint_option_state.current_expert_indices_all
+                    
+                    switch_logits_jt, _, _ = self.joint_controller(h_for_decision, current_all)
+                    switch_logits_jt = switch_logits_jt.clamp(-20, 20)
+                    switch_probs = torch.sigmoid(switch_logits_jt)
+                    bernoulli_p = switch_probs.clamp(min=1e-6, max=1 - 1e-6)
+                    rand = torch.rand(switch_probs.shape, device=device, dtype=switch_probs.dtype)
+                    switch_decision = rand < bernoulli_p
+                    
+                    if switch_decision.any():
+                        sel_indices_all = []
+                        for pos, layer_idx in enumerate(moe_layer_indices):
+                            layer_data = prefill_actions.get(layer_idx, {})
+                            layer_hidden = layer_data.get("llm_hidden_states", None)
+                            if layer_hidden is not None:
+                                h_layer = layer_hidden[:, -1, :]
+                            else:
+                                raise RuntimeError(
+                                    f"Joint option prefill: layer {layer_idx} has no recorded llm_hidden_states."
+                                )
+                            candidate_logits = self.joint_controller.compute_selection_logits(layer_idx, h_layer)
+                            candidate_logits = candidate_logits.clamp(-20, 20)
+                            selected = _mixed_policy_sample(candidate_logits, k_experts, epsilon=selection_epsilon, generator=None)
+                            sel_indices_all.append(selected)
+                        sel_indices_all = torch.stack(sel_indices_all, dim=1)
+                        
+                        new_all = torch.where(
+                            switch_decision.unsqueeze(-1).unsqueeze(-1).expand_as(sel_indices_all),
+                            sel_indices_all,
+                            current_all,
+                        )
+                        joint_option_state.current_expert_indices_all = new_all
+                    
+                    joint_option_state.last_layer_hidden = last_layer_hidden_t
+                
+                # Accumulate per-layer actions from prefill
+                for layer_idx, layer_data in prefill_actions.items():
+                    if isinstance(layer_idx, str) and layer_idx.startswith("_"):
+                        continue
+                    if layer_idx not in accumulated_actions:
+                        accumulated_actions[layer_idx] = {}
+                    for key, value_t in layer_data.items():
+                        if key not in accumulated_actions[layer_idx]:
+                            accumulated_actions[layer_idx][key] = value_t
+                        else:
+                            accumulated_actions[layer_idx][key] = torch.cat(
+                                [accumulated_actions[layer_idx][key], value_t], dim=1
+                            )
+                
+                if self.accelerator.is_main_process and (q_idx + 1) % 100 == 0:
+                    print(f"  [TEACHER-MIX] Prefill {q_idx+1}/{query_len-1} tokens", flush=True)
+            
+            # Build prefill_indices_all tensor: [batch, query_len-1, num_moe_layers, k]
+            # For q_idx=0 (None entry), we need to fill with the router top-k indices
+            # that were determined after q_idx=0's forward pass (stored in prefill_option_list[1] or later).
+            # Since q_idx=0 used vanilla routing, we use the option that was initialized
+            # from router top-k (which is what joint_option_state got set to after q_idx=0).
+            # The first non-None entry is the option initialized from router top-k.
+            first_valid_option = None
+            for opt in prefill_option_list:
+                if opt is not None:
+                    first_valid_option = opt
+                    break
+            
+            stacked = []
+            for opt in prefill_option_list:
+                if opt is None:
+                    if first_valid_option is not None:
+                        stacked.append(first_valid_option)
+                    else:
+                        stacked.append(torch.zeros(batch_size, num_moe_layers, k_experts, dtype=torch.long, device=device))
+                else:
+                    stacked.append(opt)
+            prefill_indices_all = torch.stack(stacked, dim=1)  # [batch, query_len-1, num_moe_layers, k]
+            
+            # Store in accumulated_actions for later use in replay
+            joint_key = "_joint_option"
+            if joint_key not in accumulated_actions:
+                accumulated_actions[joint_key] = {}
+            accumulated_actions[joint_key]["prefill_indices_all"] = prefill_indices_all
+            
+            if self.accelerator.is_main_process:
+                print(f"  [TEACHER-MIX] Sequential prefill complete. Recorded {prefill_indices_all.shape[1]} prefill option snapshots.", flush=True)
+        
         for step in range(max_new_tokens):
             # Determine input for this step
             if student_past_kv is None:
-                # First step: process full query
+                # First step: process full query (non-joint mode, or joint with query_len==1)
                 input_ids = current_ids
                 position_ids = None
             else:
-                # Subsequent steps: only process the new token
+                # Process the last token in current_ids
                 input_ids = current_ids[:, -1:]
-                # Need to provide correct position_ids for the new token
                 position_ids = torch.tensor([[current_ids.shape[1] - 1]], device=device).expand(batch_size, 1)
             
-            # Create attention mask for the input
             attention_mask = (current_ids != pad_token_id).long()
             
-            # =========================================================================
-            # Step 1: Get STUDENT logits (controller enabled) with student's KV cache
-            # =========================================================================
-            # Clear record_actions for this step's recording
-            # CRITICAL: Must include "sampling": True so controller uses Bernoulli sampling
-            # instead of threshold-based switching (which would give 0 switches with low probs)
-            # Use the same epsilon from controller_runtime (which has annealing applied)
+            # =============================================================
+            # Step 1: Student forward pass
+            # =============================================================
             step_runtime = {
                 "record_actions": {},
                 "sampling": True,
                 "selection_epsilon": controller_runtime.get("selection_epsilon", self._get_current_epsilon()),
             }
             
-            # Add Q-based selection parameters if enabled (same as non-teacher-mix path)
-            # Use annealed epsilon from controller_runtime (passed from _generate_rollout)
             if getattr(self.config, 'q_based_selection', False):
                 step_runtime["q_based_selection"] = True
                 step_runtime["q_selection_steps"] = getattr(self.config, 'q_selection_steps', 10)
@@ -723,6 +971,22 @@ class ActivationControllerTrainer:
                 step_runtime["q_selection_debug"] = getattr(self.config, 'q_selection_debug', False)
                 step_runtime["q_selection_init_w"] = getattr(self.config, 'q_selection_init_w', 2.0)
             
+            # Joint option: set per-layer masks from current joint state
+            if joint_mode:
+                step_runtime["joint_option_mode"] = True
+                moe_layer_indices = self.joint_controller.moe_layer_indices
+                num_experts = self.joint_controller.num_experts
+                k_experts = joint_k_experts
+                
+                if joint_option_state.current_expert_indices_all is not None:
+                    joint_masks = {}
+                    for pos, layer_idx in enumerate(moe_layer_indices):
+                        layer_indices = joint_option_state.current_expert_indices_all[:, pos, :]
+                        mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
+                        mask.scatter_(1, layer_indices, True)
+                        joint_masks[layer_idx] = mask
+                    step_runtime["joint_option_masks"] = joint_masks
+            
             student_outputs = policy(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -730,54 +994,198 @@ class ActivationControllerTrainer:
                 past_key_values=student_past_kv,
                 use_cache=True,
                 controller_runtime=step_runtime,
-                controller_states=student_controller_states,  # Maintain expert restriction across tokens!
+                controller_states=student_controller_states,
             )
             student_logits = student_outputs.logits[:, -1, :]  # [batch, vocab]
             student_past_kv = student_outputs.past_key_values
-            # Update controller states for next iteration
             student_controller_states = getattr(student_outputs, 'controller_states', None)
             
-            # Accumulate controller actions from this step
-            step_actions = step_runtime.get("record_actions", {})
-            for layer_idx, layer_data in step_actions.items():
-                if layer_idx not in accumulated_actions:
-                    accumulated_actions[layer_idx] = {}
-                for key, value in layer_data.items():
-                    if key not in accumulated_actions[layer_idx]:
-                        accumulated_actions[layer_idx][key] = value
-                    else:
-                        # Concatenate along sequence dimension (dim=1)
-                        accumulated_actions[layer_idx][key] = torch.cat(
-                            [accumulated_actions[layer_idx][key], value], dim=1
+            # =============================================================
+            # Joint option: termination / selection decision after forward
+            # =============================================================
+            if joint_mode:
+                step_actions = step_runtime.get("record_actions", {})
+                selection_epsilon = controller_runtime.get("selection_epsilon", self._get_current_epsilon())
+                
+                last_layer_hidden = step_actions.get("_last_layer_post_mlp_hidden", None)
+                last_layer_hidden_t = last_layer_hidden[:, -1, :] if last_layer_hidden is not None else None
+                
+                # Capture the option that was EXECUTED in the forward pass (before any switch)
+                # and the hidden state used for the decision (h_{t-1})
+                executed_option_t = joint_option_state.current_expert_indices_all  # may be None for first token
+                decision_hidden_t = joint_option_state.last_layer_hidden  # h_{t-1}, None for first token
+                
+                if executed_option_t is None:
+                    # Very first token: init from router top-k (query_len==1 case)
+                    all_indices = []
+                    for pos, layer_idx in enumerate(moe_layer_indices):
+                        layer_data = step_actions.get(layer_idx, {})
+                        layer_router_logits = layer_data.get("router_logits", None)
+                        if layer_router_logits is not None:
+                            top_k_indices = torch.topk(layer_router_logits[:, -1, :], k_experts, dim=-1).indices
+                        else:
+                            top_k_indices = torch.zeros(batch_size, k_experts, dtype=torch.long, device=device)
+                        all_indices.append(top_k_indices)
+                    joint_option_state.current_expert_indices_all = torch.stack(all_indices, dim=1)
+                    joint_option_state.last_layer_hidden = last_layer_hidden_t
+                    executed_option_t = joint_option_state.current_expert_indices_all
+                    
+                    switch_decision = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                    switch_logprob = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                    value = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                    q_u_old = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                    selected_indices_all = joint_option_state.current_expert_indices_all.clone()
+                else:
+                    h_for_decision = decision_hidden_t
+                    current_all = executed_option_t
+                    
+                    switch_logits_jt, value, _ = self.joint_controller(h_for_decision, current_all)
+                    q_u_old = self.joint_controller.compute_q_option(h_for_decision, current_all)
+                    
+                    switch_logits_jt = switch_logits_jt.clamp(-20, 20)
+                    switch_probs = torch.sigmoid(switch_logits_jt)
+                    bernoulli_p = switch_probs.clamp(min=1e-6, max=1 - 1e-6)
+                    rand = torch.rand(switch_probs.shape, device=device, dtype=switch_probs.dtype)
+                    switch_decision = rand < bernoulli_p
+                    
+                    switch_logprob = torch.where(
+                        switch_decision,
+                        torch.log(bernoulli_p),
+                        torch.log(1 - bernoulli_p),
+                    )
+                    
+                    selected_indices_all = []
+                    for pos, layer_idx in enumerate(moe_layer_indices):
+                        layer_data = step_actions.get(layer_idx, {})
+                        layer_hidden = layer_data.get("llm_hidden_states", None)
+                        if layer_hidden is not None:
+                            h_layer = layer_hidden[:, -1, :]
+                        else:
+                            raise RuntimeError(
+                                f"Joint option: layer {layer_idx} has no recorded llm_hidden_states. "
+                                f"This should not happen -- forward_joint_option should always record them."
+                            )
+                        candidate_logits = self.joint_controller.compute_selection_logits(layer_idx, h_layer)
+                        candidate_logits = candidate_logits.clamp(-20, 20)
+                        selected = _mixed_policy_sample(
+                            candidate_logits, k_experts,
+                            epsilon=selection_epsilon, generator=None,
                         )
+                        selected_indices_all.append(selected)
+                    selected_indices_all = torch.stack(selected_indices_all, dim=1)
+                    
+                    new_all = torch.where(
+                        switch_decision.unsqueeze(-1).unsqueeze(-1).expand_as(selected_indices_all),
+                        selected_indices_all,
+                        current_all,
+                    )
+                    joint_option_state.current_expert_indices_all = new_all
+                    joint_option_state.last_layer_hidden = last_layer_hidden_t
+                
+                # Record joint option actions
+                # executed_indices_all[t]: option used in the forward pass at step t (pre-switch)
+                # selected_indices_all[t]: newly selected option (if switch happened)
+                # current_indices_all[t]: option after switch decision (= executed at step t+1)
+                # decision_hidden[t]: h_{t-1} used for the termination/V/Q decision
+                # last_layer_hidden[t]: h_t from this step's forward pass
+                joint_record = {
+                    "switches": switch_decision.unsqueeze(1),
+                    "switch_logprobs": switch_logprob.unsqueeze(1),
+                    "values": value.unsqueeze(1),
+                    "q_u_old_values": q_u_old.unsqueeze(1),
+                    "selected_indices_all": selected_indices_all.unsqueeze(1) if isinstance(selected_indices_all, torch.Tensor) else joint_option_state.current_expert_indices_all.unsqueeze(1),
+                    "executed_indices_all": executed_option_t.unsqueeze(1),
+                    "current_indices_all": joint_option_state.current_expert_indices_all.unsqueeze(1),
+                }
+                if last_layer_hidden_t is not None:
+                    joint_record["last_layer_hidden"] = last_layer_hidden_t.unsqueeze(1)
+                if decision_hidden_t is not None:
+                    joint_record["decision_hidden"] = decision_hidden_t.unsqueeze(1)
+                else:
+                    # First token: no decision was made, use h_t as placeholder
+                    joint_record["decision_hidden"] = last_layer_hidden_t.unsqueeze(1) if last_layer_hidden_t is not None else torch.zeros(batch_size, 1, self.joint_controller.hidden_size, device=device)
+                
+                joint_key = "_joint_option"
+                if joint_key not in accumulated_actions:
+                    accumulated_actions[joint_key] = {}
+                for key, val in joint_record.items():
+                    if key not in accumulated_actions[joint_key]:
+                        accumulated_actions[joint_key][key] = val
+                    else:
+                        accumulated_actions[joint_key][key] = torch.cat(
+                            [accumulated_actions[joint_key][key], val], dim=1
+                        )
+                
+                # Accumulate per-layer actions
+                for layer_idx, layer_data in step_actions.items():
+                    if isinstance(layer_idx, str) and layer_idx.startswith("_"):
+                        continue
+                    if layer_idx not in accumulated_actions:
+                        accumulated_actions[layer_idx] = {}
+                    for key, value_t in layer_data.items():
+                        if key not in accumulated_actions[layer_idx]:
+                            accumulated_actions[layer_idx][key] = value_t
+                        else:
+                            accumulated_actions[layer_idx][key] = torch.cat(
+                                [accumulated_actions[layer_idx][key], value_t], dim=1
+                            )
+            else:
+                # Per-layer mode: accumulate actions
+                step_actions = step_runtime.get("record_actions", {})
+                for layer_idx, layer_data in step_actions.items():
+                    if layer_idx not in accumulated_actions:
+                        accumulated_actions[layer_idx] = {}
+                    for key, value_t in layer_data.items():
+                        if key not in accumulated_actions[layer_idx]:
+                            accumulated_actions[layer_idx][key] = value_t
+                        else:
+                            accumulated_actions[layer_idx][key] = torch.cat(
+                                [accumulated_actions[layer_idx][key], value_t], dim=1
+                            )
             
-            # =========================================================================
-            # Step 2: Get TEACHER logits (controller disabled) with teacher's KV cache
-            # =========================================================================
+            # =============================================================
+            # Step 2: Teacher forward pass
+            # For joint mode, the teacher was not processed during prefill,
+            # so on the first gen step we feed the full query (single pass).
+            # =============================================================
+            if teacher_past_kv is None:
+                teacher_input_ids = current_ids[:, :query_len]
+                teacher_position_ids = None
+                teacher_attn_mask = (current_ids[:, :query_len] != pad_token_id).long()
+            else:
+                teacher_input_ids = input_ids
+                teacher_position_ids = position_ids
+                teacher_attn_mask = attention_mask
+            
             self._set_controller_enabled(policy, False)
+            
+            if hasattr(self, 'ppl_scorer') and self.ppl_scorer is not None:
+                self.ppl_scorer._swap_router_weights(policy, use_original=True)
             
             if is_peft:
                 with policy.disable_adapter():
                     teacher_outputs = policy(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
+                        input_ids=teacher_input_ids,
+                        attention_mask=teacher_attn_mask,
+                        position_ids=teacher_position_ids,
                         past_key_values=teacher_past_kv,
                         use_cache=True,
                     )
             else:
                 teacher_outputs = policy(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attn_mask,
+                    position_ids=teacher_position_ids,
                     past_key_values=teacher_past_kv,
                     use_cache=True,
                 )
             teacher_logits = teacher_outputs.logits[:, -1, :]  # [batch, vocab]
             teacher_past_kv = teacher_outputs.past_key_values
             
-            # Re-enable controller for next iteration
-            self._set_controller_enabled(policy, True)
+            if hasattr(self, 'ppl_scorer') and self.ppl_scorer is not None:
+                self.ppl_scorer._swap_router_weights(policy, use_original=False)
+            if not joint_mode:
+                self._set_controller_enabled(policy, True)
             
             # =========================================================================
             # Step 3: Mix distributions and sample
@@ -828,6 +1236,10 @@ class ActivationControllerTrainer:
                     print(f"  [TEACHER-MIX] All sequences finished at step {step+1}", flush=True)
                 break
         
+        # Re-enable per-layer controllers if we disabled them for joint option
+        if self.joint_option and self.joint_controller is not None:
+            self._set_controller_enabled(policy, True)
+        
         # Copy accumulated actions to controller_runtime
         controller_runtime["record_actions"] = accumulated_actions
         
@@ -850,12 +1262,15 @@ class ActivationControllerTrainer:
                       f"Check if student/teacher distributions are very different.", flush=True)
             
             # Validate recorded actions
+            # Note: rec_seq_len = current_ids - 1 is expected, because the last generated
+            # token is appended to current_ids but never fed back as input, so no controller
+            # action is recorded for it.
             if accumulated_actions:
                 first_layer = next(iter(accumulated_actions.keys()))
                 rec_seq_len = accumulated_actions[first_layer].get("switches", torch.tensor([])).shape[1] if "switches" in accumulated_actions[first_layer] else 0
-                expected_len = current_ids.shape[1]
+                expected_len = current_ids.shape[1] - 1
                 if rec_seq_len != expected_len:
-                    print(f"  [TEACHER-MIX] WARNING: recorded_actions seq_len={rec_seq_len} != expected {expected_len}", flush=True)
+                    print(f"  [TEACHER-MIX] WARNING: recorded_actions seq_len={rec_seq_len} != expected {expected_len} (current_ids={current_ids.shape[1]})", flush=True)
                 else:
                     print(f"  [TEACHER-MIX] Recorded actions validated: {len(accumulated_actions)} layers, seq_len={rec_seq_len}", flush=True)
         
@@ -925,10 +1340,16 @@ class ActivationControllerTrainer:
         
         gen_start = time.time()
         
-        if teacher_mix_alpha > 0:
+        if self.joint_option and teacher_mix_alpha <= 0:
+            # Joint option mode requires teacher-mix generation loop (manual token-by-token)
+            # Force teacher_mix_alpha=0 through the same code path
+            if self.accelerator.is_main_process:
+                print(f"  [ROLLOUT] Joint option mode: using manual generation loop (α=0)", flush=True)
+            teacher_mix_alpha = 0.0
+        
+        if teacher_mix_alpha > 0 or self.joint_option:
             # =========================================================================
-            # Teacher-mixed sampling (MiniLLM-style)
-            # Sample from: p_mixed = α * p_teacher + (1-α) * p_student
+            # Teacher-mixed sampling (MiniLLM-style) OR joint option manual generation
             # =========================================================================
             if self.accelerator.is_main_process:
                 print(f"  [ROLLOUT] Using teacher-mixed sampling with α={teacher_mix_alpha}", flush=True)
@@ -1132,7 +1553,11 @@ class ActivationControllerTrainer:
         
         # Apply latency penalty normalized by sequence length AND number of layers
         # This penalizes switch RATE (fraction of token-layer pairs that switched)
-        num_layers = len(recorded_actions)
+        # In joint mode there is one shared switch decision per token, so num_layers=1
+        if "_joint_option" in recorded_actions:
+            num_layers = 1
+        else:
+            num_layers = len(recorded_actions)
         # Use real_query_lengths (excluding left-padding) + response_lengths (excluding right-padding)
         total_seq_len = real_query_lengths.float() + response_lengths.float()  # [batch]
         # switch_rate is now between 0 and 1 (fraction of possible switches)
@@ -1364,10 +1789,30 @@ class ActivationControllerTrainer:
         V_targets = V_values.detach() + V_advantages
         Q_exec_targets = Q_exec_values.detach() + Q_exec_advantages
         
+        if self.accelerator.is_main_process and layer_idx == 0:
+            valid_V_adv = V_advantages[valid_mask]
+            valid_Q_adv = Q_exec_advantages[valid_mask]
+            valid_reward = per_token_reward[valid_mask]
+            print(f"  [ACT-LAYER0] per_token_reward: min={valid_reward.min().item():.6f}, max={valid_reward.max().item():.6f}, "
+                  f"mean={valid_reward.mean().item():.6f}, std={valid_reward.std().item():.6f}", flush=True)
+            print(f"  [ACT-LAYER0] V_advantages: min={valid_V_adv.min().item():.6f}, max={valid_V_adv.max().item():.6f}, "
+                  f"mean={valid_V_adv.mean().item():.6f}, std={valid_V_adv.std().item():.6f}", flush=True)
+            print(f"  [ACT-LAYER0] Q_exec_advantages: min={valid_Q_adv.min().item():.6f}, max={valid_Q_adv.max().item():.6f}, "
+                  f"mean={valid_Q_adv.mean().item():.6f}, std={valid_Q_adv.std().item():.6f}", flush=True)
+            print(f"  [ACT-LAYER0] V_targets: min={V_targets[valid_mask].min().item():.6f}, "
+                  f"max={V_targets[valid_mask].max().item():.6f}, "
+                  f"mean={V_targets[valid_mask].mean().item():.6f}", flush=True)
+            print(f"  [ACT-LAYER0] Q_exec_targets: min={Q_exec_targets[valid_mask].min().item():.6f}, "
+                  f"max={Q_exec_targets[valid_mask].max().item():.6f}, "
+                  f"mean={Q_exec_targets[valid_mask].mean().item():.6f}", flush=True)
+        
         # =========================================================================
         # Compute intra-option returns (for LLM policy gradient)
         # This is G (discounted return) WITHOUT Q baseline, computed separately
-        # from GAE advantages because intra-option update needs raw returns
+        # from GAE advantages because intra-option update needs raw returns.
+        #
+        # For truncated (non-terminated) sequences, we bootstrap with V(s_{t+1})
+        # at the boundary, matching the GAE computation above.
         # =========================================================================
         intra_option_returns = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
         G_accumulator = torch.zeros(batch_size, device=device, dtype=torch.float32)
@@ -1380,14 +1825,21 @@ class ActivationControllerTrainer:
                 at_boundary = ~next_is_valid
                 should_bootstrap_at_boundary = at_boundary & ~terminated
                 
-                # Accumulate discounted return
+                V_next = V_values[:, t+1].detach()
+                
                 G_accumulator = torch.where(
-                    next_is_valid | should_bootstrap_at_boundary,
+                    next_is_valid,
                     r_t + gamma * G_accumulator,
-                    r_t  # At terminal, just immediate reward
+                    torch.where(
+                        should_bootstrap_at_boundary,
+                        r_t + gamma * V_next,
+                        r_t
+                    )
                 )
             else:
-                # Last valid timestep: just immediate reward (terminal)
+                # Last position in tensor (t = seq_len - 1).
+                # This is typically padding; the real boundary bootstrap
+                # is handled above when t+1 crosses valid_end.
                 G_accumulator = r_t
             
             intra_option_returns[:, t] = G_accumulator
@@ -1467,13 +1919,13 @@ class ActivationControllerTrainer:
             select_loss = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
         else:
             # Plackett-Luce selection: compute log prob
-            # Normalize A_select
+            # RMS-normalize A_select (no centering — it's already an advantage)
+            # Consistent with termination advantage normalization
             select_mask = switches.bool() & valid_mask & t_mask
             A_select_used = A_select[select_mask]
             if A_select_used.numel() > 1:
-                A_select_mean = A_select_used.mean()
-                A_select_std = A_select_used.std().clamp(min=1e-8)
-                A_select_norm = (A_select - A_select_mean) / A_select_std
+                A_select_rms = torch.sqrt((A_select_used ** 2).mean()).clamp(min=1e-8)
+                A_select_norm = A_select / A_select_rms
             else:
                 A_select_norm = A_select
             
@@ -1484,6 +1936,16 @@ class ActivationControllerTrainer:
                 indices_t = selected_indices[:, t, :]
                 log_prob_t = _plackett_luce_logprob_batched(logits_t, indices_t)
                 selection_log_probs[:, t] = log_prob_t
+            
+            if layer_idx == 0 and self.accelerator.is_main_process:
+                valid_lp = selection_log_probs[select_mask]
+                valid_a = A_select_norm[select_mask]
+                if valid_lp.numel() > 0:
+                    print(f"  [PERLAYER-SELECT-DEBUG] layer {layer_idx}: PL_logprob at switch positions: "
+                          f"mean={valid_lp.mean().item():.4f}, min={valid_lp.min().item():.4f}, max={valid_lp.max().item():.4f}", flush=True)
+                    print(f"  [PERLAYER-SELECT-DEBUG] A_select_norm at switch positions: "
+                          f"mean={valid_a.mean().item():.4f}, std={valid_a.std().item():.4f}, "
+                          f"num_switch={select_mask.sum().item()}", flush=True)
             
             # Selection loss with importance weighting for off-policy correction
             select_loss_raw = -A_select_norm * selection_log_probs
@@ -1852,20 +2314,24 @@ class ActivationControllerTrainer:
         # Create full-sequence importance weights for off-policy correction
         # rollout.importance_weights: [batch, response_len] from teacher-mixed sampling
         # We expand to [batch, seq_len] with query positions having weight=1.0
+        #
+        # Alignment: importance_weights[j] corrects for response token j being
+        # sampled from the mixed distribution. The reward for response token j is
+        # placed at position (query_len - 1 + j) (prediction position), so the
+        # importance weight must be placed at the same position.
         # =========================================================================
         full_seq_importance_weights = None
         if rollout.importance_weights is not None:
             iw_response = rollout.importance_weights  # [batch, response_len]
             full_seq_importance_weights = torch.ones(batch_size, seq_len, device=device, dtype=torch.float32)
             
-            # Place response importance weights at response positions
-            # Response starts at query_len in the full sequence
             iw_response_len = iw_response.shape[1]
-            available_space = seq_len - query_len
+            start_idx = query_len - 1
+            available_space = seq_len - start_idx
             actual_iw_len = min(iw_response_len, available_space)
             
             if actual_iw_len > 0:
-                full_seq_importance_weights[:, query_len:query_len + actual_iw_len] = iw_response[:, :actual_iw_len].to(device)
+                full_seq_importance_weights[:, start_idx:start_idx + actual_iw_len] = iw_response[:, :actual_iw_len].to(device)
             
             if self.accelerator.is_main_process:
                 valid_iw = full_seq_importance_weights[valid_mask]
@@ -2046,18 +2512,33 @@ class ActivationControllerTrainer:
             print(f"  [OC-FWD] total_policy_loss={avg_policy_loss:.4f}, mean_value_loss={avg_value_loss:.4f}", flush=True)
             print(f"  [OC-FWD] expert_entropy={self._last_expert_entropy:.4f} (max={math.log(num_experts):.2f})", flush=True)
         
+        avg_term_loss = sum(m["mean_term_loss"] for m in layer_metrics.values()) / max(num_layers, 1) if layer_metrics else 0.0
+        avg_select_loss = sum(m["mean_select_loss"] for m in layer_metrics.values()) / max(num_layers, 1) if layer_metrics else 0.0
+        avg_V_loss_per_layer = sum(m["mean_V_loss"] for m in layer_metrics.values()) / max(num_layers, 1) if layer_metrics else 0.0
+        avg_Q_loss_per_layer = sum(m["mean_Q_loss"] for m in layer_metrics.values()) / max(num_layers, 1) if layer_metrics else 0.0
+        
+        if self.accelerator.is_main_process:
+            per_layer_select = [m["mean_select_loss"] for m in layer_metrics.values()]
+            per_layer_term = [m["mean_term_loss"] for m in layer_metrics.values()]
+            print(f"  [OC-FWD] avg_term_loss={avg_term_loss:.4f}, avg_select_loss={avg_select_loss:.4f}", flush=True)
+            print(f"  [OC-FWD] per-layer select_loss (first 6): {[f'{x:.4f}' for x in per_layer_select[:6]]}", flush=True)
+            print(f"  [OC-FWD] per-layer select_loss min={min(per_layer_select):.4f}, max={max(per_layer_select):.4f}, "
+                  f"std={torch.tensor(per_layer_select).std().item():.4f}", flush=True)
+        
         return {
-            "loss": scaled_loss,  # Tensor for backward
-            "loss_value": total_loss.item(),  # Unscaled loss for logging
+            "loss": scaled_loss,
+            "loss_value": total_loss.item(),
             "policy_loss": avg_policy_loss,
             "value_loss": avg_value_loss,
+            "mean_term_loss": avg_term_loss,
+            "mean_select_loss": avg_select_loss,
+            "mean_V_loss": avg_V_loss_per_layer,
+            "mean_Q_loss": avg_Q_loss_per_layer,
             "switch_rate": avg_switch_rate,
             "layer_metrics": layer_metrics,
-            # For intra-option policy update
             "intra_option_advantages": intra_option_advantages,
             "intra_option_q_values": intra_option_q_values,
             "valid_masks_per_layer": valid_masks_per_layer,
-            # Termination binariness metrics
             "switch_prob_mean": avg_switch_prob_mean,
             "switch_prob_std": avg_switch_prob_std,
             "switch_binary_frac": avg_switch_binary_frac,
@@ -2067,6 +2548,556 @@ class ActivationControllerTrainer:
             "switch_prob_p95": max_switch_prob_p95,
             "frac_gt_0p1": avg_frac_gt_0p1,
             "frac_gt_0p5": avg_frac_gt_0p5,
+        }
+    
+    def _compute_single_rollout_loss_joint(
+        self,
+        rollout: ControllerRollout,
+        scale_factor: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Compute loss for a single rollout in JOINT OPTION mode.
+        
+        Key differences from per-layer mode:
+        - Single GAE computation using joint V/Q
+        - Single termination loss
+        - Per-layer selection losses (using per-layer selection heads)
+        - Intra-option returns computed once
+        """
+        device = rollout.queries.device
+        batch_size = rollout.batch_size
+        query_len = rollout.queries.shape[1]
+        response_lengths = rollout.response_lengths
+        
+        per_token_kl = rollout.per_token_kl
+        if per_token_kl is None:
+            raise ValueError("Joint option controller requires per_token_kl")
+        
+        # Get joint option data from recorded actions
+        joint_data = rollout.layer_data.get("_joint_option")
+        if joint_data is None:
+            raise ValueError("No joint option data found in rollout. Was joint_option mode enabled during generation?")
+        
+        # Get sequence length from per-layer data
+        moe_layer_indices = self.joint_controller.moe_layer_indices
+        first_layer_idx = moe_layer_indices[0]
+        first_layer_data = rollout.layer_data.get(first_layer_idx)
+        if first_layer_data is None:
+            raise ValueError(f"No layer data for layer {first_layer_idx}")
+        seq_len = first_layer_data["router_logits"].shape[1]
+        
+        # Build per_token_base_reward (same as per-layer mode)
+        per_token_base_reward = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        kl_response_len = per_token_kl.shape[1]
+        for i in range(batch_size):
+            reward_start = query_len - 1
+            available_space = seq_len - reward_start
+            actual_resp_len = min(kl_response_len, int(response_lengths[i].item()), available_space)
+            if actual_resp_len > 0:
+                per_token_base_reward[i, reward_start:reward_start+actual_resp_len] = -per_token_kl[i, :actual_resp_len]
+        
+        # Repetition penalty (same as per-layer mode)
+        rep_c = self.config.repetition_penalty_c
+        rep_decay = self.config.repetition_penalty_decay
+        responses = rollout.responses
+        rep_penalty_tensor = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        batch_rep_rates = []
+        batch_num_repeats = []
+        batch_total_tokens = []
+        
+        for i in range(batch_size):
+            resp_len = int(response_lengths[i].item())
+            if resp_len <= 0:
+                continue
+            resp_tokens = responses[i, :resp_len].cpu().tolist()
+            last_pos = {}
+            num_repeats = 0
+            for t, token_id in enumerate(resp_tokens):
+                if token_id in last_pos:
+                    num_repeats += 1
+                    if rep_c != 0.0:
+                        d = t - last_pos[token_id]
+                        penalty = rep_c * (rep_decay ** d)
+                        pred_pos = query_len - 1 + t
+                        if pred_pos < seq_len:
+                            rep_penalty_tensor[i, pred_pos] = penalty
+                last_pos[token_id] = t
+            unique_count = len(last_pos)
+            rep_rate = 1.0 - unique_count / resp_len if resp_len > 0 else 0.0
+            batch_rep_rates.append(rep_rate)
+            batch_num_repeats.append(num_repeats)
+            batch_total_tokens.append(resp_len)
+        
+        if batch_rep_rates:
+            self._last_rep_rate_mean = sum(batch_rep_rates) / len(batch_rep_rates)
+            self._last_rep_rate_max = max(batch_rep_rates)
+            self._last_num_repeats_mean = sum(batch_num_repeats) / len(batch_num_repeats)
+            self._last_repeat_frac_mean = sum(batch_num_repeats) / sum(batch_total_tokens) if sum(batch_total_tokens) > 0 else 0.0
+        else:
+            self._last_rep_rate_mean = 0.0
+            self._last_rep_rate_max = 0.0
+            self._last_num_repeats_mean = 0.0
+            self._last_repeat_frac_mean = 0.0
+        
+        if rep_c != 0.0:
+            per_token_base_reward = per_token_base_reward + rep_penalty_tensor
+            rep_penalty_sum_per_sample = rep_penalty_tensor.sum(dim=1)
+            self._last_rep_penalty_sum_mean = rep_penalty_sum_per_sample.mean().item()
+            if self.accelerator.is_main_process:
+                nonzero_penalty = rep_penalty_tensor[rep_penalty_tensor != 0]
+                if nonzero_penalty.numel() > 0:
+                    self._last_rep_penalty_mean = nonzero_penalty.mean().item()
+                    print(f"  [JOINT-OC] Repetition penalty (c={rep_c}, λ={rep_decay}): "
+                          f"num_penalized={nonzero_penalty.numel()}, "
+                          f"mean={nonzero_penalty.mean().item():.6f}, "
+                          f"min={nonzero_penalty.min().item():.6f}, max={nonzero_penalty.max().item():.6f}", flush=True)
+                else:
+                    self._last_rep_penalty_mean = 0.0
+                    print(f"  [JOINT-OC] Repetition penalty (c={rep_c}, λ={rep_decay}): no repeats found", flush=True)
+        else:
+            self._last_rep_penalty_mean = 0.0
+            self._last_rep_penalty_sum_mean = 0.0
+        
+        if self.accelerator.is_main_process:
+            print(f"  [JOINT-OC] Repetition metrics: rep_rate_mean={self._last_rep_rate_mean:.4f}, "
+                  f"rep_rate_max={self._last_rep_rate_max:.4f}, "
+                  f"num_repeats_mean={self._last_num_repeats_mean:.1f}, "
+                  f"repeat_frac={self._last_repeat_frac_mean:.4f}", flush=True)
+        
+        REWARD_NORMALIZATION_CONSTANT = 512.0
+        per_token_base_reward = per_token_base_reward / REWARD_NORMALIZATION_CONSTANT
+        
+        # Valid mask (covers full seq_len including query positions)
+        query_attention_mask = (rollout.queries != rollout.pad_token_id).long()
+        real_query_lengths = query_attention_mask.sum(dim=1)
+        left_padding_lengths = query_len - real_query_lengths
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        start = left_padding_lengths.unsqueeze(1)
+        end = (query_len + response_lengths).unsqueeze(1)
+        valid_mask = (positions >= start) & (positions < end)
+        valid_end = end
+        terminated = rollout.terminated if rollout.terminated is not None else torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # Importance weights
+        full_seq_importance_weights = None
+        if rollout.importance_weights is not None:
+            iw_response = rollout.importance_weights
+            full_seq_importance_weights = torch.ones(batch_size, seq_len, device=device, dtype=torch.float32)
+            iw_response_len = iw_response.shape[1]
+            start_idx = query_len - 1
+            available_space = seq_len - start_idx
+            actual_iw_len = min(iw_response_len, available_space)
+            if actual_iw_len > 0:
+                full_seq_importance_weights[:, start_idx:start_idx + actual_iw_len] = iw_response[:, :actual_iw_len].to(device)
+        
+        # Extract joint option tensors (these have joint_seq_len = num generation steps,
+        # which is shorter than seq_len = query_len + response_len from per-layer data)
+        switches_joint = joint_data["switches"].to(device)  # [batch, joint_seq_len]
+        selected_indices_all_joint = joint_data["selected_indices_all"].to(device)  # [batch, joint_seq_len, num_layers, k]
+        executed_indices_all_joint = joint_data.get("executed_indices_all")
+        if executed_indices_all_joint is not None:
+            executed_indices_all_joint = executed_indices_all_joint.to(device)  # [batch, joint_seq_len, num_layers, k]
+        else:
+            # Backward compat
+            executed_indices_all_joint = joint_data["current_indices_all"].to(device)
+            if self.accelerator.is_main_process:
+                print("  [JOINT-OC] WARNING: executed_indices_all not found, falling back to current_indices_all", flush=True)
+        current_indices_all_joint = joint_data["current_indices_all"].to(device)  # [batch, joint_seq_len, num_layers, k]
+        
+        # decision_hidden[t] = h_{t-1}, the hidden state used for the termination/V/Q decision
+        # last_layer_hidden[t] = h_t, the hidden state from step t's forward pass
+        decision_hidden_joint = joint_data.get("decision_hidden", None)
+        if decision_hidden_joint is not None:
+            decision_hidden_joint = decision_hidden_joint.to(device)  # [batch, joint_seq_len, hidden]
+        else:
+            # Backward compat: fall back to last_layer_hidden (incorrect but avoids crash)
+            decision_hidden_joint = joint_data.get("last_layer_hidden", None)
+            if decision_hidden_joint is not None:
+                decision_hidden_joint = decision_hidden_joint.to(device)
+            if self.accelerator.is_main_process:
+                print("  [JOINT-OC] WARNING: decision_hidden not found, falling back to last_layer_hidden", flush=True)
+        joint_seq_len = switches_joint.shape[1]
+        pad_len = seq_len - joint_seq_len
+        
+        gamma = self.config.gamma
+        deliberation_cost = self.config.option_critic_deliberation_cost
+        num_layers = len(moe_layer_indices)
+        num_experts = self.joint_controller.num_experts
+        
+        if self.accelerator.is_main_process:
+            print(f"  [JOINT-OC] batch_size={batch_size}, seq_len={seq_len}, joint_seq_len={joint_seq_len}, pad_len={pad_len}, num_layers={num_layers}", flush=True)
+            print(f"  [JOINT-OC] gamma={gamma}, deliberation_cost={deliberation_cost}", flush=True)
+        
+        # =========================================================================
+        # Batched forward through joint controller (only over joint_seq_len positions)
+        # Use decision_hidden (h_{t-1}) and executed_indices_all (pre-switch option)
+        # to match the actual (state, option) pair used during the rollout decision
+        # =========================================================================
+        h_flat = decision_hidden_joint.view(batch_size * joint_seq_len, -1).float()
+        executed_all_flat = executed_indices_all_joint.view(batch_size * joint_seq_len, num_layers, -1)
+        selected_all_flat = selected_indices_all_joint.view(batch_size * joint_seq_len, num_layers, -1)
+        
+        # Forward: termination + V using (h_{t-1}, executed_option_t)
+        switch_logits_flat, V_flat, _ = self.joint_controller(h_flat, executed_all_flat)
+        
+        # Q for executed option (pre-switch) and newly selected option
+        Q_U_old_flat = self.joint_controller.compute_q_option(h_flat, executed_all_flat)
+        Q_U_new_flat = self.joint_controller.compute_q_option(h_flat, selected_all_flat)
+        
+        # Reshape to [batch, joint_seq_len]
+        V_joint = V_flat.view(batch_size, joint_seq_len).float()
+        Q_U_old_joint = Q_U_old_flat.view(batch_size, joint_seq_len).float()
+        Q_U_new_joint = Q_U_new_flat.view(batch_size, joint_seq_len).float()
+        switch_logits_joint = switch_logits_flat.clamp(-20, 20).view(batch_size, joint_seq_len).float()
+        
+        # Pad to full seq_len (prepend zeros for query positions so indexing aligns with valid_mask)
+        if pad_len > 0:
+            V_values = F.pad(V_joint, (pad_len, 0), value=0.0)
+            Q_U_old_values = F.pad(Q_U_old_joint, (pad_len, 0), value=0.0)
+            Q_U_new_values = F.pad(Q_U_new_joint, (pad_len, 0), value=0.0)
+            switch_logits = F.pad(switch_logits_joint, (pad_len, 0), value=0.0)
+            switches = F.pad(switches_joint.float(), (pad_len, 0), value=0.0).bool()
+            selected_indices_all = F.pad(selected_indices_all_joint, (0, 0, 0, 0, pad_len, 0), value=0)
+            current_indices_all = F.pad(current_indices_all_joint, (0, 0, 0, 0, pad_len, 0), value=0)
+        else:
+            V_values = V_joint
+            Q_U_old_values = Q_U_old_joint
+            Q_U_new_values = Q_U_new_joint
+            switch_logits = switch_logits_joint
+            switches = switches_joint
+            selected_indices_all = selected_indices_all_joint
+            current_indices_all = current_indices_all_joint
+        
+        # In joint mode, switches[t]=1 means "switch AFTER step t's forward pass".
+        # The reward r_t was produced under executed_indices_all[t] (old option).
+        # So Q_exec[t] is ALWAYS Q of the executed (old) option, regardless of switches[t].
+        # This differs from per-layer mode where switches[t]=1 means the new option was
+        # used AT step t.
+        Q_exec_values = Q_U_old_values
+        
+        per_token_reward = per_token_base_reward.float()
+        
+        # Joint valid mask: only positions where joint option data exists (>= pad_len)
+        # Query-only positions have zero-padded controller outputs and should not contribute to loss
+        joint_valid_mask = valid_mask & (positions >= pad_len)
+        
+        # =========================================================================
+        # GAE computation (single, not per-layer)
+        # =========================================================================
+        gae_lambda = self.config.gae_lambda
+        beta_probs = torch.sigmoid(switch_logits)
+        
+        gae_V = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        gae_Q_exec = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        V_advantages = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        Q_exec_advantages = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        
+        for t in reversed(range(seq_len)):
+            r_t = per_token_reward[:, t]
+            V_t = V_values[:, t].detach()
+            Q_exec_t = Q_exec_values[:, t].detach()
+            
+            if t + 1 < seq_len:
+                next_is_valid = (t + 1) < valid_end.squeeze(1)
+                V_next = V_values[:, t+1].detach()
+                beta_next = beta_probs[:, t+1].detach()
+                Q_continue_next = Q_U_old_values[:, t+1].detach()
+                
+                at_boundary = ~next_is_valid
+                should_bootstrap_at_boundary = at_boundary & ~terminated
+                
+                V_bootstrap = torch.where(
+                    next_is_valid, gamma * V_next,
+                    torch.where(should_bootstrap_at_boundary, gamma * V_next, torch.zeros_like(V_next))
+                )
+                delta_V = r_t + V_bootstrap - V_t
+                
+                # In joint mode, switches[t]=1 means old option terminated AFTER step t.
+                # If terminated: next-state value for Q of old option is just V(s_{t+1})
+                #   (the old option is done; a new option was selected)
+                # If not terminated: U(s_{t+1}, o) = β_{t+1}*V_{t+1} + (1-β_{t+1})*Q(s_{t+1}, o_same)
+                switched_t = switches[:, t].bool() if t < switches.shape[1] else torch.zeros(batch_size, dtype=torch.bool, device=device)
+                soft_bootstrap_continue = gamma * (beta_next * V_next + (1 - beta_next) * Q_continue_next)
+                soft_bootstrap_term = gamma * V_next
+                soft_bootstrap = torch.where(switched_t, soft_bootstrap_term, soft_bootstrap_continue)
+                Q_bootstrap = torch.where(
+                    next_is_valid, soft_bootstrap,
+                    torch.where(should_bootstrap_at_boundary, soft_bootstrap, torch.zeros_like(soft_bootstrap))
+                )
+                delta_Q_exec = r_t + Q_bootstrap - Q_exec_t
+                
+                should_continue_gae = next_is_valid | should_bootstrap_at_boundary
+                gae_V = torch.where(should_continue_gae, delta_V + gamma * gae_lambda * gae_V, delta_V)
+                # Cut Q GAE trace when option terminates (switches[t]=1), because
+                # the old option's trajectory ends here and future GAE terms belong
+                # to a different option.
+                q_should_continue = should_continue_gae & ~switched_t
+                gae_Q_exec = torch.where(q_should_continue, delta_Q_exec + gamma * gae_lambda * gae_Q_exec, delta_Q_exec)
+            else:
+                gae_V = r_t - V_t
+                gae_Q_exec = r_t - Q_exec_t
+            
+            V_advantages[:, t] = gae_V
+            Q_exec_advantages[:, t] = gae_Q_exec
+        
+        V_targets = V_values.detach() + V_advantages
+        Q_exec_targets = Q_exec_values.detach() + Q_exec_advantages
+        
+        if self.accelerator.is_main_process:
+            valid_V_adv = V_advantages[joint_valid_mask]
+            valid_Q_adv = Q_exec_advantages[joint_valid_mask]
+            valid_reward = per_token_reward[joint_valid_mask]
+            print(f"  [JOINT-OC] per_token_reward: min={valid_reward.min().item():.6f}, max={valid_reward.max().item():.6f}, "
+                  f"mean={valid_reward.mean().item():.6f}, std={valid_reward.std().item():.6f}", flush=True)
+            print(f"  [JOINT-OC] V_advantages: min={valid_V_adv.min().item():.6f}, max={valid_V_adv.max().item():.6f}, "
+                  f"mean={valid_V_adv.mean().item():.6f}, std={valid_V_adv.std().item():.6f}", flush=True)
+            print(f"  [JOINT-OC] Q_exec_advantages: min={valid_Q_adv.min().item():.6f}, max={valid_Q_adv.max().item():.6f}, "
+                  f"mean={valid_Q_adv.mean().item():.6f}, std={valid_Q_adv.std().item():.6f}", flush=True)
+            print(f"  [JOINT-OC] V_targets: min={V_targets[joint_valid_mask].min().item():.6f}, "
+                  f"max={V_targets[joint_valid_mask].max().item():.6f}, "
+                  f"mean={V_targets[joint_valid_mask].mean().item():.6f}", flush=True)
+            print(f"  [JOINT-OC] Q_exec_targets: min={Q_exec_targets[joint_valid_mask].min().item():.6f}, "
+                  f"max={Q_exec_targets[joint_valid_mask].max().item():.6f}, "
+                  f"mean={Q_exec_targets[joint_valid_mask].mean().item():.6f}", flush=True)
+        
+        # Intra-option returns (for LLM policy gradient)
+        intra_option_returns = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+        G_accumulator = torch.zeros(batch_size, device=device, dtype=torch.float32)
+        for t in reversed(range(seq_len)):
+            r_t = per_token_reward[:, t]
+            if t + 1 < seq_len:
+                next_is_valid = (t + 1) < valid_end.squeeze(1)
+                at_boundary = ~next_is_valid
+                should_bootstrap_at_boundary = at_boundary & ~terminated
+                V_next = V_values[:, t+1].detach()
+                G_accumulator = torch.where(
+                    next_is_valid, r_t + gamma * G_accumulator,
+                    torch.where(should_bootstrap_at_boundary, r_t + gamma * V_next, r_t)
+                )
+            else:
+                G_accumulator = r_t
+            intra_option_returns[:, t] = G_accumulator
+        
+        # =========================================================================
+        # Losses
+        # =========================================================================
+        t_mask = torch.ones(seq_len, device=device, dtype=torch.bool)
+        t_mask[0] = False
+        t_mask = t_mask.unsqueeze(0).expand(batch_size, -1)
+        
+        # Termination advantage
+        adv_term = Q_U_old_values.detach() - V_values.detach() + deliberation_cost
+        A_select = Q_U_new_values.detach() - V_values.detach()
+        
+        if getattr(self.config, 'term_adv_rms_norm', False):
+            term_mask = joint_valid_mask & t_mask
+            adv_term_used = adv_term[term_mask]
+            if adv_term_used.numel() > 1:
+                adv_term_rms = torch.sqrt((adv_term_used ** 2).mean()).clamp(min=1e-8)
+                adv_term = adv_term / adv_term_rms
+        
+        # Value loss
+        V_loss = (V_values - V_targets.detach()) ** 2
+        Q_loss = (Q_exec_values - Q_exec_targets.detach()) ** 2
+        
+        # Termination loss
+        beta_probs_clamped = beta_probs.clamp(1e-6, 1 - 1e-6)
+        term_loss_raw = adv_term * beta_probs_clamped
+        if full_seq_importance_weights is not None:
+            term_loss_raw = full_seq_importance_weights * term_loss_raw
+        term_loss = torch.where(joint_valid_mask & t_mask, term_loss_raw, torch.zeros_like(adv_term))
+        
+        num_valid = joint_valid_mask[:, 1:].sum()
+        num_switch = (switches.bool() & joint_valid_mask & t_mask).sum()
+        
+        if full_seq_importance_weights is not None:
+            term_weight_sum = (full_seq_importance_weights * (joint_valid_mask & t_mask).float()).sum().clamp(min=1e-8)
+            mean_term_loss = term_loss.sum() / term_weight_sum
+        else:
+            mean_term_loss = term_loss.sum() / max(num_valid, 1)
+        
+        # Per-layer selection loss (using per-layer selection heads)
+        total_select_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        select_mask = switches.bool() & joint_valid_mask & t_mask
+        A_select_used = A_select[select_mask]
+        if A_select_used.numel() > 1:
+            A_select_rms = torch.sqrt((A_select_used ** 2).mean()).clamp(min=1e-8)
+            A_select_norm = A_select / A_select_rms
+        else:
+            A_select_norm = A_select
+        
+        joint_per_layer_select_losses = []
+        for pos, layer_idx in enumerate(moe_layer_indices):
+            layer_data = rollout.layer_data.get(layer_idx)
+            if layer_data is None:
+                continue
+            layer_hidden = layer_data.get("llm_hidden_states", None)
+            if layer_hidden is None:
+                continue
+            layer_hidden = layer_hidden.to(device)
+            
+            # Get per-layer selected indices from joint option
+            layer_selected = selected_indices_all[:, :, pos, :]  # [batch, seq_len, k]
+            
+            # Compute selection logits for this layer
+            h_layer_flat = layer_hidden.view(batch_size * seq_len, -1).float()
+            candidate_logits_flat = self.joint_controller.compute_selection_logits(layer_idx, h_layer_flat)
+            candidate_logits_flat = candidate_logits_flat.clamp(-20, 20)
+            candidate_logits_layer = candidate_logits_flat.view(batch_size, seq_len, num_experts)
+            
+            # Compute PL log-prob
+            selection_log_probs = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
+            for t in range(seq_len):
+                logits_t = candidate_logits_layer[:, t, :]
+                indices_t = layer_selected[:, t, :]
+                log_prob_t = _plackett_luce_logprob_batched(logits_t, indices_t)
+                selection_log_probs[:, t] = log_prob_t
+            
+            if self.accelerator.is_main_process and pos == 0:
+                valid_lp = selection_log_probs[select_mask]
+                valid_a = A_select_norm[select_mask]
+                print(f"  [JOINT-SELECT-DEBUG] layer {layer_idx}: PL_logprob at switch positions: "
+                      f"mean={valid_lp.mean().item():.4f}, min={valid_lp.min().item():.4f}, max={valid_lp.max().item():.4f}", flush=True)
+                print(f"  [JOINT-SELECT-DEBUG] A_select_norm at switch positions: "
+                      f"mean={valid_a.mean().item():.4f}, std={valid_a.std().item():.4f}, "
+                      f"num_switch={select_mask.sum().item()}", flush=True)
+            
+            select_loss_raw = -A_select_norm * selection_log_probs
+            if full_seq_importance_weights is not None:
+                select_loss_raw = full_seq_importance_weights * select_loss_raw
+            select_loss = torch.where(select_mask, select_loss_raw, torch.zeros_like(selection_log_probs))
+            
+            if full_seq_importance_weights is not None:
+                select_weight_sum = (full_seq_importance_weights * select_mask.float()).sum().clamp(min=1e-8)
+                mean_select_loss = select_loss.sum() / select_weight_sum if num_switch > 0 else select_loss.sum()
+            else:
+                mean_select_loss = select_loss.sum() / max(num_switch, 1)
+            
+            joint_per_layer_select_losses.append(mean_select_loss.item())
+            total_select_loss = total_select_loss + mean_select_loss
+        
+        # Normalize selection loss by number of layers (matches per-layer controller)
+        total_select_loss = total_select_loss / max(num_layers, 1)
+        
+        if self.accelerator.is_main_process and joint_per_layer_select_losses:
+            import numpy as np
+            arr = np.array(joint_per_layer_select_losses)
+            print(f"  [JOINT-SELECT-DEBUG] per-layer select_loss (first 6): {[f'{x:.4f}' for x in arr[:6]]}", flush=True)
+            print(f"  [JOINT-SELECT-DEBUG] per-layer select_loss: min={arr.min():.4f}, max={arr.max():.4f}, "
+                  f"mean={arr.mean():.4f}, std={arr.std():.4f}", flush=True)
+            print(f"  [JOINT-SELECT-DEBUG] total_select_loss (after /num_layers)={total_select_loss.item():.4f}", flush=True)
+        
+        policy_loss = mean_term_loss + total_select_loss
+        
+        V_loss_masked = torch.where(joint_valid_mask, V_loss, torch.zeros_like(V_loss))
+        Q_loss_masked = torch.where(joint_valid_mask, Q_loss, torch.zeros_like(Q_loss))
+        value_loss = (V_loss_masked + Q_loss_masked).sum(dim=1)
+        
+        jv_mask = joint_valid_mask.float()
+        mean_V_loss = (V_loss * jv_mask).sum() / max(jv_mask.sum(), 1)
+        mean_Q_loss = (Q_loss * jv_mask).sum() / max(jv_mask.sum(), 1)
+        
+        num_valid_timesteps = num_valid.item()
+        value_loss_sum = value_loss.sum()
+        mean_value_loss = value_loss_sum / max(num_valid_timesteps, 1)
+        
+        # Expert entropy (averaged across layers, matching per-layer mode)
+        total_expert_entropy = torch.tensor(0.0, device=device, requires_grad=True)
+        num_layers_with_entropy = 0
+        for pos, layer_idx in enumerate(moe_layer_indices):
+            layer_data = rollout.layer_data.get(layer_idx)
+            if layer_data is None:
+                continue
+            layer_router_logits = layer_data.get("router_logits")
+            if layer_router_logits is None:
+                continue
+            layer_router_logits = layer_router_logits.to(device)
+            expert_softmax = torch.softmax(layer_router_logits, dim=-1)
+            expert_log_softmax = torch.log_softmax(layer_router_logits, dim=-1)
+            entropy_per_pos = -(expert_softmax * expert_log_softmax).sum(dim=-1)
+            valid_entropy_mask = joint_valid_mask & t_mask
+            layer_entropy = (entropy_per_pos * valid_entropy_mask).sum() / valid_entropy_mask.sum().clamp(min=1)
+            total_expert_entropy = total_expert_entropy + layer_entropy
+            num_layers_with_entropy += 1
+        
+        mean_expert_entropy = total_expert_entropy / max(num_layers_with_entropy, 1)
+        self._last_expert_entropy = mean_expert_entropy.item()
+        
+        entropy_coef = getattr(self.config, 'entropy_coef', 0.0)
+        entropy_bonus = -entropy_coef * mean_expert_entropy
+        
+        total_loss = policy_loss + self.config.value_coef * mean_value_loss + entropy_bonus
+        scaled_loss = total_loss * scale_factor
+        
+        # Compute switch rate
+        switch_rate = (switches.bool() & joint_valid_mask & t_mask).float().sum().item() / max(num_valid_timesteps, 1)
+        
+        # Termination binariness metrics (matching per-layer mode exactly)
+        with torch.no_grad():
+            valid_switch_probs = beta_probs[joint_valid_mask & t_mask]
+            if valid_switch_probs.numel() > 0:
+                switch_prob_mean = valid_switch_probs.mean().item()
+                switch_prob_std = valid_switch_probs.std().item() if valid_switch_probs.numel() > 1 else 0.0
+                binary_frac = ((valid_switch_probs < 0.1) | (valid_switch_probs > 0.9)).float().mean().item()
+                p = valid_switch_probs.clamp(1e-7, 1 - 1e-7)
+                switch_entropy = (-p * p.log() - (1 - p) * (1 - p).log()).mean().item()
+                switch_prob_max = valid_switch_probs.max().item()
+                switch_prob_p90 = torch.quantile(valid_switch_probs, 0.90).item() if valid_switch_probs.numel() >= 10 else switch_prob_max
+                switch_prob_p95 = torch.quantile(valid_switch_probs, 0.95).item() if valid_switch_probs.numel() >= 20 else switch_prob_max
+                frac_gt_0p1 = (valid_switch_probs > 0.1).float().mean().item()
+                frac_gt_0p5 = (valid_switch_probs > 0.5).float().mean().item()
+            else:
+                switch_prob_mean = 0.0
+                switch_prob_std = 0.0
+                binary_frac = 0.0
+                switch_entropy = 0.0
+                switch_prob_max = 0.0
+                switch_prob_p90 = 0.0
+                switch_prob_p95 = 0.0
+                frac_gt_0p1 = 0.0
+                frac_gt_0p5 = 0.0
+        
+        if self.accelerator.is_main_process:
+            print(f"  [JOINT-OC] policy_loss={policy_loss.item():.4f} (term={mean_term_loss.item():.4f}, "
+                  f"select={total_select_loss.item():.4f}), value_loss={mean_value_loss.item():.4f}, "
+                  f"switch_rate={switch_rate:.4f}", flush=True)
+            print(f"  [JOINT-OC] V_mean={V_values[joint_valid_mask].mean().item():.4f}, "
+                  f"Q_exec_mean={Q_exec_values[joint_valid_mask].mean().item():.4f}, "
+                  f"expert_entropy={self._last_expert_entropy:.4f}", flush=True)
+            print(f"  [JOINT-OC] switch_prob: mean={switch_prob_mean:.4f}, std={switch_prob_std:.4f}, "
+                  f"max={switch_prob_max:.4f}, p90={switch_prob_p90:.4f}, p95={switch_prob_p95:.4f}", flush=True)
+            print(f"  [JOINT-OC] binary_frac={binary_frac:.4f}, entropy={switch_entropy:.4f}, "
+                  f"frac>0.1={frac_gt_0p1:.4f}, frac>0.5={frac_gt_0p5:.4f}", flush=True)
+        
+        # For intra-option update: single set of returns (not per-layer)
+        intra_option_advantages = {"_joint": intra_option_returns.detach()}
+        intra_option_q_values = {"_joint": Q_exec_values.detach()}
+        valid_masks_per_layer = {"_joint": joint_valid_mask}
+        
+        return {
+            "loss": scaled_loss,
+            "loss_value": total_loss.item(),
+            "policy_loss": policy_loss.item(),
+            "value_loss": mean_value_loss.item(),
+            "mean_term_loss": mean_term_loss.item(),
+            "mean_select_loss": total_select_loss.item(),
+            "mean_V_loss": mean_V_loss.item(),
+            "mean_Q_loss": mean_Q_loss.item(),
+            "switch_rate": switch_rate,
+            "layer_metrics": {},
+            "intra_option_advantages": intra_option_advantages,
+            "intra_option_q_values": intra_option_q_values,
+            "valid_masks_per_layer": valid_masks_per_layer,
+            "switch_prob_mean": switch_prob_mean,
+            "switch_prob_std": switch_prob_std,
+            "switch_binary_frac": binary_frac,
+            "switch_entropy": switch_entropy,
+            "switch_prob_max": switch_prob_max,
+            "switch_prob_p90": switch_prob_p90,
+            "switch_prob_p95": switch_prob_p95,
+            "frac_gt_0p1": frac_gt_0p1,
+            "frac_gt_0p5": frac_gt_0p5,
         }
     
     # =========================================================================
@@ -2112,39 +3143,114 @@ class ActivationControllerTrainer:
         # Create attention mask (1 for real tokens, 0 for padding)
         attention_mask = (input_ids != rollout.pad_token_id).long()
         
-        # Build replay_actions from rollout.layer_data
-        # This tells the model to use the recorded expert selections instead of sampling
-        replay_actions = {}
-        for layer_idx, layer_data in rollout.layer_data.items():
-            recorded_seq_len = layer_data["switches"].shape[1]
-            
-            # Debug: check for sequence length mismatch
-            if self.accelerator.is_main_process and layer_idx == 0:
-                print(f"  [INTRA-OPT-DEBUG] total_len={total_len}, recorded_seq_len={recorded_seq_len}, query_len={query_len}, response_len={response_len}", flush=True)
-            
-            # Pad replay actions if needed (in case of off-by-one from generation)
-            switches = layer_data["switches"]
-            selected_indices = layer_data["selected_indices"]
-            
-            if recorded_seq_len < total_len:
-                # Pad with zeros (no switch) to avoid index error
-                pad_size = total_len - recorded_seq_len
-                # switches is bool tensor - pad with False (no switch for padded positions)
-                switches = F.pad(switches.float(), (0, pad_size), value=0.0).bool()
-                selected_indices = F.pad(selected_indices, (0, 0, 0, pad_size), value=0)
-                if self.accelerator.is_main_process and layer_idx == 0:
-                    print(f"  [INTRA-OPT-DEBUG] Padded replay actions from {recorded_seq_len} to {total_len}", flush=True)
-            
-            replay_actions[layer_idx] = {
-                "switches": switches,  # [batch, seq_len]
-                "selected_indices": selected_indices,  # [batch, seq_len, k]
-            }
+        # Build replay configuration from rollout.layer_data
+        is_joint_mode = "_joint_option" in rollout.layer_data
         
-        # Set up controller runtime for replay
-        controller_runtime = {
-            "sampling": False,
-            "replay_actions": replay_actions,
-        }
+        if is_joint_mode:
+            # Joint mode: build per-token joint_option_masks for replay
+            # Use executed_indices_all (the option actually used in each forward pass)
+            # NOT current_indices_all (which is the post-switch option)
+            joint_data = rollout.layer_data["_joint_option"]
+            executed_indices_all = joint_data.get("executed_indices_all")
+            if executed_indices_all is not None:
+                executed_indices_all = executed_indices_all.to(device)  # [batch, joint_seq_len, num_layers, k]
+            else:
+                # Backward compat: fall back to current_indices_all if executed not recorded
+                executed_indices_all = joint_data["current_indices_all"].to(device)
+                if self.accelerator.is_main_process:
+                    print("  [INTRA-OPT-DEBUG] WARNING: executed_indices_all not found, falling back to current_indices_all", flush=True)
+            moe_layer_indices = self.joint_controller.moe_layer_indices
+            num_experts = self.joint_controller.num_experts
+            joint_seq_len = executed_indices_all.shape[1]
+            
+            # Per-layer data has seq_len = query_len + response_len - 1 (prefill + gen)
+            first_layer_idx = moe_layer_indices[0]
+            first_layer_data = rollout.layer_data.get(first_layer_idx)
+            recorded_seq_len = first_layer_data["router_logits"].shape[1] if first_layer_data is not None else total_len
+            prefill_indices_all = joint_data.get("prefill_indices_all")  # [batch, query_len-1, num_moe_layers, k] or None
+            
+            if self.accelerator.is_main_process:
+                has_prefill = prefill_indices_all is not None
+                prefill_shape = prefill_indices_all.shape if has_prefill else None
+                print(f"  [INTRA-OPT-DEBUG] Joint mode: total_len={total_len}, recorded_seq_len={recorded_seq_len}, "
+                      f"joint_seq_len={joint_seq_len}, query_len={query_len}, response_len={response_len}, "
+                      f"has_prefill_masks={has_prefill}, prefill_shape={prefill_shape}", flush=True)
+            
+            # Build per-token masks for the full sequence [batch, total_len, num_experts]
+            # Prefill positions: per-token options recorded during sequential prefill
+            # Generation positions: executed_indices_all (the option that was actually used)
+            
+            joint_masks_per_layer = {}
+            for pos, layer_idx in enumerate(moe_layer_indices):
+                per_token_mask = torch.zeros(batch_size, total_len, num_experts, dtype=torch.bool, device=device)
+                
+                prefill_len = min(query_len - 1, total_len)
+                if prefill_indices_all is not None and prefill_len > 0:
+                    prefill_for_layer = prefill_indices_all[:, :prefill_len, pos, :]  # [batch, prefill_len, k]
+                    per_token_mask[:, :prefill_len, :].scatter_(2, prefill_for_layer.to(device), True)
+                    # Position 0 used vanilla routing (no mask) during generation,
+                    # so allow all experts to match the original softmax distribution
+                    per_token_mask[:, 0, :] = True
+                elif prefill_len > 0:
+                    # Fallback: no prefill data recorded (shouldn't happen in joint mode with query_len>1)
+                    first_option_indices = executed_indices_all[:, 0, pos, :]  # [batch, k]
+                    prefill_mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
+                    prefill_mask.scatter_(1, first_option_indices, True)
+                    per_token_mask[:, :prefill_len, :] = prefill_mask.unsqueeze(1).expand(-1, prefill_len, -1)
+                
+                gen_start = query_len - 1
+                gen_len = min(joint_seq_len, total_len - gen_start)
+                if gen_len > 0:
+                    gen_indices = executed_indices_all[:, :gen_len, pos, :]  # [batch, gen_len, k]
+                    per_token_mask[:, gen_start:gen_start + gen_len, :].scatter_(2, gen_indices, True)
+                    # If no prefill occurred (query_len<=1), the first generation step used
+                    # vanilla routing (no mask), so allow all experts at that position
+                    if prefill_indices_all is None and gen_len > 0:
+                        per_token_mask[:, gen_start, :] = True
+                
+                # Pad remaining positions (if total_len > gen_start + gen_len)
+                if gen_len > 0 and gen_start + gen_len < total_len:
+                    last_indices = executed_indices_all[:, gen_len - 1, pos, :]
+                    last_mask = torch.zeros(batch_size, num_experts, dtype=torch.bool, device=device)
+                    last_mask.scatter_(1, last_indices, True)
+                    remaining = total_len - (gen_start + gen_len)
+                    per_token_mask[:, gen_start + gen_len:, :] = last_mask.unsqueeze(1).expand(-1, remaining, -1)
+                
+                joint_masks_per_layer[layer_idx] = per_token_mask  # [batch, total_len, num_experts]
+            
+            controller_runtime = {
+                "sampling": False,
+                "joint_option_mode": True,
+                "joint_option_masks": joint_masks_per_layer,
+            }
+        else:
+            # Per-layer mode: build replay_actions as before
+            replay_actions = {}
+            for layer_idx, layer_data in rollout.layer_data.items():
+                recorded_seq_len = layer_data["switches"].shape[1]
+                
+                if self.accelerator.is_main_process and layer_idx == 0:
+                    print(f"  [INTRA-OPT-DEBUG] total_len={total_len}, recorded_seq_len={recorded_seq_len}, query_len={query_len}, response_len={response_len}", flush=True)
+                
+                switches = layer_data["switches"]
+                selected_indices = layer_data["selected_indices"]
+                
+                if recorded_seq_len < total_len:
+                    pad_size = total_len - recorded_seq_len
+                    switches = F.pad(switches.float(), (0, pad_size), value=0.0).bool()
+                    selected_indices = F.pad(selected_indices, (0, 0, 0, pad_size), value=0)
+                    if self.accelerator.is_main_process and layer_idx == 0:
+                        print(f"  [INTRA-OPT-DEBUG] Padded replay actions from {recorded_seq_len} to {total_len}", flush=True)
+                
+                replay_actions[layer_idx] = {
+                    "switches": switches,
+                    "selected_indices": selected_indices,
+                }
+            
+            controller_runtime = {
+                "sampling": False,
+                "replay_actions": replay_actions,
+            }
         
         # Get the unwrapped model for forward pass
         model = self.model
@@ -2165,22 +3271,24 @@ class ActivationControllerTrainer:
             print(f"  [INTRA-OPT-DEBUG] policy type: {type(policy).__name__}, "
                   f"trainable params: {trainable_count}/{total_count}", flush=True)
         
+        # Joint mode: disable per-layer controllers for replay (masks are external)
+        if is_joint_mode:
+            self._set_controller_enabled(policy, False)
+        
         # CRITICAL: Wrap forward pass with torch.enable_grad() to ensure gradient tracking
         # even if we're in a no_grad context or gradient checkpointing is interfering
         with torch.enable_grad():
-            # Forward pass with gradients (for LoRA + router)
-            # Note: We pass replay_actions so the model uses the same expert selections as during rollout
             outputs = policy(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 controller_runtime=controller_runtime,
                 use_cache=False,
             )
-            
-            # Get logits and compute token log probabilities
-            # outputs.logits: [batch, total_len, vocab_size]
-            # For causal LM, logits at position t predict token at position t+1
             logits = outputs.logits  # [batch, total_len, vocab_size]
+        
+        # Re-enable per-layer controllers after replay
+        if is_joint_mode:
+            self._set_controller_enabled(policy, True)
         
         if self.accelerator.is_main_process:
             print(f"  [INTRA-OPT-GRAD] logits.requires_grad={logits.requires_grad}, "
@@ -2223,10 +3331,12 @@ class ActivationControllerTrainer:
         first_layer_idx = next(iter(intra_option_advantages.keys()))
         first_advantage = intra_option_advantages[first_layer_idx]
         adv_seq_len = first_advantage.shape[1]
-        # Advantages start at query_len - 1 (the first prediction position for response tokens)
+        # Both advantages and masks start at query_len - 1 (the prediction position for
+        # the first response token). The valid_mask at position p tells us whether the
+        # action at position p is within a valid sequence, which aligns with the advantage
+        # at position p.
         adv_start = query_len - 1
-        # Mask starts at query_len (the target token positions)
-        mask_start = query_len
+        mask_start = query_len - 1
         # available_response_len must account for BOTH advantage and mask slicing
         adv_available = adv_seq_len - adv_start if adv_seq_len > adv_start else 0
         mask_available = adv_seq_len - mask_start if adv_seq_len > mask_start else 0
@@ -2366,9 +3476,22 @@ class ActivationControllerTrainer:
         if self.accelerator.is_main_process:
             baseline_str = "G - Q" if use_q_baseline else "G"
             iw_str = f", importance_weighted=True" if importance_weights is not None else ""
+            valid_log_probs = response_token_log_probs[total_valid_mask]
+            valid_norm_adv = normalized_advantage[total_valid_mask]
             print(f"  [INTRA-OPTION] Loss: {intra_option_loss.item():.6f}, "
                   f"avg_adv ({baseline_str}): mean={valid_advs.mean().item():.4f}, std={valid_advs.std().item() if valid_advs.numel() > 1 else 0:.4f}, "
                   f"token_temp: {token_temperature}{iw_str}", flush=True)
+            print(f"  [INTRA-OPTION] log_probs: mean={valid_log_probs.mean().item():.4f}, "
+                  f"min={valid_log_probs.min().item():.4f}, max={valid_log_probs.max().item():.4f}, "
+                  f"std={valid_log_probs.std().item():.4f}", flush=True)
+            print(f"  [INTRA-OPTION] norm_adv: mean={valid_norm_adv.mean().item():.4f}, "
+                  f"min={valid_norm_adv.min().item():.4f}, max={valid_norm_adv.max().item():.4f}, "
+                  f"std={valid_norm_adv.std().item():.4f}", flush=True)
+            if importance_weights is not None:
+                valid_iw_product = (importance_weights * normalized_advantage * response_token_log_probs)[total_valid_mask]
+                print(f"  [INTRA-OPTION] |w*A*logp|: mean={valid_iw_product.abs().mean().item():.4f}, "
+                      f"max={valid_iw_product.abs().max().item():.4f}, "
+                      f"num_valid={total_valid_mask.sum().item()}", flush=True)
         
         return intra_option_loss
     
@@ -2462,6 +3585,10 @@ class ActivationControllerTrainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_switch_rate = 0.0
+        total_term_loss = 0.0
+        total_select_loss = 0.0
+        total_V_loss = 0.0
+        total_Q_loss = 0.0
         
         # Multiple update epochs on the same batch (like PPO)
         for epoch_idx in range(self.config.num_update_epochs):
@@ -2475,7 +3602,10 @@ class ActivationControllerTrainer:
             
             for accum_idx, rollout in enumerate(rollouts):
                 # Compute loss (scaled for accumulation)
-                result = self._compute_single_rollout_loss(rollout, scale_factor=scale_factor)
+                if self.joint_option and self.joint_controller is not None:
+                    result = self._compute_single_rollout_loss_joint(rollout, scale_factor=scale_factor)
+                else:
+                    result = self._compute_single_rollout_loss(rollout, scale_factor=scale_factor)
                 
                 # Check for NaN
                 loss_finite = torch.isfinite(result["loss"]).item()
@@ -2543,6 +3673,11 @@ class ActivationControllerTrainer:
                     total_policy_loss += result["policy_loss"]
                     total_value_loss += result["value_loss"]
                     total_switch_rate += result["switch_rate"]
+                    if "mean_term_loss" in result:
+                        total_term_loss += result["mean_term_loss"]
+                        total_select_loss += result["mean_select_loss"]
+                        total_V_loss += result["mean_V_loss"]
+                        total_Q_loss += result["mean_Q_loss"]
                     
                     # Store termination binariness metrics from last rollout (for logging)
                     if "switch_prob_mean" in result:
@@ -2720,6 +3855,10 @@ class ActivationControllerTrainer:
             "loss": total_loss / n_accum,
             "policy_loss": total_policy_loss / n_accum,
             "value_loss": total_value_loss / n_accum,
+            "mean_term_loss": total_term_loss / n_accum,
+            "mean_select_loss": total_select_loss / n_accum,
+            "mean_V_loss": total_V_loss / n_accum,
+            "mean_Q_loss": total_Q_loss / n_accum,
             "reward_mean": global_reward_mean,
             "switch_rate": global_switch_rate,
             "batch_size": total_batch_size,
@@ -2777,6 +3916,11 @@ class ActivationControllerTrainer:
         running_metrics = {"loss": 0.0, "reward": 0.0, "switches": 0.0}
         running_count = 0
         
+        # Calculate how many dataloader batches to skip when resuming
+        resume_skip_batches = self.global_step * grad_accum_steps if self.global_step > 0 else 0
+        if resume_skip_batches > 0 and accelerator.is_main_process:
+            print(f"[RESUME] Skipping {resume_skip_batches} batches ({self.global_step} steps x {grad_accum_steps} accum) to resume from step {self.global_step}")
+        
         for epoch in range(config.num_train_epochs):
             self.epoch = epoch
             
@@ -2786,12 +3930,14 @@ class ActivationControllerTrainer:
             
             # Create progress bar (only on main process)
             # Progress is per optimizer step, not per batch
+            total_steps = len(self.train_dataloader) // grad_accum_steps
             if accelerator.is_main_process:
                 pbar = tqdm(
-                    total=len(self.train_dataloader) // grad_accum_steps,
+                    total=total_steps,
                     desc=f"Epoch {epoch+1}/{config.num_train_epochs}",
                     dynamic_ncols=True,
                     leave=True,
+                    initial=min(self.global_step, total_steps),
                 )
             
             # Collect batches for gradient accumulation
@@ -2799,6 +3945,14 @@ class ActivationControllerTrainer:
             batch_gt_answers = []
             
             for batch_idx, batch in enumerate(self.train_dataloader):
+                # Skip batches that were already processed before checkpoint
+                if batch_idx < resume_skip_batches:
+                    if batch_idx == 0 and accelerator.is_main_process:
+                        print(f"[RESUME] Skipping batches...", flush=True)
+                    continue
+                if batch_idx == resume_skip_batches and resume_skip_batches > 0 and accelerator.is_main_process:
+                    print(f"[RESUME] Done skipping, resuming training from batch {batch_idx}", flush=True)
+                
                 if isinstance(batch, dict):
                     queries = batch["input_ids"]
                     gt_answers = batch.get("ground_truth_answers", None)
@@ -2862,6 +4016,10 @@ class ActivationControllerTrainer:
                         "train/loss": metrics["loss"],
                         "train/policy_loss": metrics["policy_loss"],
                         "train/value_loss": metrics["value_loss"],
+                        "train/mean_term_loss": metrics["mean_term_loss"],
+                        "train/mean_select_loss": metrics["mean_select_loss"],
+                        "train/mean_V_loss": metrics["mean_V_loss"],
+                        "train/mean_Q_loss": metrics["mean_Q_loss"],
                         "train/reward_mean": metrics["reward_mean"],
                         "train/switch_rate": metrics["switch_rate"],
                         "train/batch_size": metrics["batch_size"],
@@ -2973,6 +4131,34 @@ class ActivationControllerTrainer:
             if self.wandb_run is not None:
                 wandb.finish()
     
+    def _get_router_state_dict(self):
+        """Extract router weight state dict from the model."""
+        router_state = {}
+        model = self.accelerator.unwrap_model(self.model)
+        if hasattr(model, 'base_model'):
+            model = model.base_model
+        if hasattr(model, 'model'):
+            model = model.model
+        for name, param in model.named_parameters():
+            if '.router.' in name or 'router.weight' in name or 'router.bias' in name:
+                router_state[name] = param.data.cpu().clone()
+        return router_state
+    
+    def _load_router_state_dict(self, router_state):
+        """Load router weights back into the model."""
+        model = self.accelerator.unwrap_model(self.model)
+        if hasattr(model, 'base_model'):
+            model = model.base_model
+        if hasattr(model, 'model'):
+            model = model.model
+        model_state = dict(model.named_parameters())
+        loaded = 0
+        for name, saved_param in router_state.items():
+            if name in model_state:
+                model_state[name].data.copy_(saved_param.to(model_state[name].device))
+                loaded += 1
+        return loaded
+    
     def save_checkpoint(self, path: str):
         """Save activation controller checkpoint."""
         if self.accelerator.is_main_process:
@@ -2985,7 +4171,13 @@ class ActivationControllerTrainer:
                 "step": self.global_step,
                 "epoch": self.epoch,
                 "config": self.config,
+                "router_state_dict": self._get_router_state_dict(),
             }
+            
+            # Save joint controller if in joint option mode
+            if self.joint_option and self.joint_controller is not None:
+                checkpoint["joint_controller"] = self.joint_controller.state_dict()
+                checkpoint["joint_option"] = True
             
             # Save LLM optimizer state if intra-option update is enabled
             if self.llm_optimizer is not None:
@@ -2993,6 +4185,8 @@ class ActivationControllerTrainer:
             
             torch.save(checkpoint, path)
             print(f"[CHECKPOINT] Saved to {path}")
+            if self.joint_option:
+                print(f"[CHECKPOINT] Includes joint controller state")
             
             # Save PEFT/LoRA weights if enabled
             if self.lora_enabled and self.peft_model is not None:
@@ -3008,8 +4202,22 @@ class ActivationControllerTrainer:
                 print(f"[CHECKPOINT] Saved LoRA (latest) to {lora_latest_dir}")
     
     def load_checkpoint(self, path: str, load_optimizer: bool = True):
-        """Load activation controller checkpoint."""
+        """Load activation controller checkpoint.
+        
+        Restores: controller params, optimizer states, LoRA weights, global_step, epoch.
+        The training loop uses global_step to skip already-completed steps.
+        """
+        import os
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        
+        # Load joint controller if in joint option mode
+        if self.joint_option and self.joint_controller is not None and "joint_controller" in checkpoint:
+            self.joint_controller.load_state_dict(checkpoint["joint_controller"])
+            if self.accelerator.is_main_process:
+                print(f"[CHECKPOINT] Loaded joint controller state")
+        elif self.joint_option and "joint_controller" not in checkpoint:
+            if self.accelerator.is_main_process:
+                print(f"  [WARN] Joint option mode enabled but no joint_controller in checkpoint. Starting fresh.")
         
         for layer_idx, state_dict in checkpoint.get("activation_controllers", {}).items():
             if layer_idx in self.activation_controllers:
@@ -3031,6 +4239,46 @@ class ActivationControllerTrainer:
                 print(f"  [WARN] Failed to load LLM optimizer: {e}")
                 import traceback
                 traceback.print_exc()
+        
+        # Load LoRA weights if available
+        if self.lora_enabled and self.peft_model is not None:
+            checkpoint_dir = os.path.dirname(path)
+            step = checkpoint.get("step", 0)
+            lora_dir = os.path.join(checkpoint_dir, f"lora_step_{step}")
+            if not os.path.exists(lora_dir):
+                lora_dir = os.path.join(checkpoint_dir, "lora_latest")
+            if os.path.exists(lora_dir):
+                try:
+                    from peft import set_peft_model_state_dict
+                    from safetensors.torch import load_file
+                    safetensors_path = os.path.join(lora_dir, "adapter_model.safetensors")
+                    bin_path = os.path.join(lora_dir, "adapter_model.bin")
+                    if os.path.exists(safetensors_path):
+                        adapter_state = load_file(safetensors_path)
+                    elif os.path.exists(bin_path):
+                        adapter_state = torch.load(bin_path, map_location="cpu", weights_only=True)
+                    else:
+                        raise FileNotFoundError(f"No adapter weights found in {lora_dir}")
+                    set_peft_model_state_dict(self.peft_model, adapter_state)
+                    if self.accelerator.is_main_process:
+                        print(f"[CHECKPOINT] Loaded LoRA weights from {lora_dir} ({len(adapter_state)} tensors)")
+                except Exception as e:
+                    if self.accelerator.is_main_process:
+                        print(f"  [WARN] Failed to load LoRA weights from {lora_dir}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            else:
+                if self.accelerator.is_main_process:
+                    print(f"  [WARN] No LoRA weights found at {lora_dir}, using fresh LoRA")
+        
+        # Load router weights if available
+        if "router_state_dict" in checkpoint:
+            loaded = self._load_router_state_dict(checkpoint["router_state_dict"])
+            if self.accelerator.is_main_process:
+                print(f"[CHECKPOINT] Loaded {loaded} router weight tensors")
+        else:
+            if self.accelerator.is_main_process:
+                print(f"  [WARN] No router weights in checkpoint (pre-existing checkpoints won't have them)")
         
         self.global_step = checkpoint.get("step", 0)
         self.epoch = checkpoint.get("epoch", 0)

@@ -4,14 +4,13 @@ This repository implements **temporally extended MoE** controller training using
 
 **Paper:** [Temporally Extended Mixture-of-Experts Models](https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf)
 
-**Project Page:** [https://zeyushen-yo.github.io/rl_moe/](https://zeyushen-yo.github.io/rl_moe/)
+**Project Page:** [https://princeton-polaris-lab.github.io/temoe/](https://princeton-polaris-lab.github.io/temoe/)
 
 ## Features
 
 - **Activation-based Controller**: Uses LLM hidden states directly with DeepSets for expert selection
 - **Option-Critic with Deliberation Costs**: Learns when to switch expert sets via termination, value, and Plackett-Luce selection heads
 - **Self-Distillation Reward**: Per-token reverse KL between frozen teacher and controller-augmented student
-- **Distributed Training**: Support for DeepSpeed and Accelerate
 
 ## Installation
 

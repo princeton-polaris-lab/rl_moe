@@ -4,7 +4,7 @@ This repository implements **temporally extended MoE** controller training using
 
 **Paper:** [Temporally Extended Mixture-of-Experts Models](https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf)
 
-**Project Page:** Coming soon
+**Project Page:** [https://zeyushen-yo.github.io/rl_moe/](https://zeyushen-yo.github.io/rl_moe/)
 
 ## Features
 

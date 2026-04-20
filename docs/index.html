@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Temporally Extended Mixture-of-Experts Models</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <a href="#overview">Overview</a>
+  <a href="#problem">Motivation</a>
+  <a href="#method">Method</a>
+  <a href="#results">Results</a>
+  <a href="https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf">Paper</a>
+  <a href="https://github.com/zeyushen-yo/rl_moe/tree/main">Code</a>
+</nav>
+
+<!-- Hero -->
+<div class="hero-section">
+  <div class="col">
+    <h1>Temporally Extended Mixture-of-Experts Models</h1>
+    <p class="subtitle">
+      Modern MoE LLMs switch their active expert set at almost every generated token. That foreclosures memory optimizations like offloading once expert counts outgrow GPU capacity. We argue that this is exactly the structure that <strong>options with deliberation costs</strong> were designed for &mdash; and show that even pretrained MoEs (like <code>gpt-oss-20b</code>) can be cheaply converted into <strong>temporally extended</strong> ones, dropping switch rates from <strong>&gt;50%</strong> to <strong>under 5%</strong> while retaining most of the base model's accuracy.
+    </p>
+    <p class="authors">
+      <a href="https://x.com/Zeyu_Shen_yo">Zeyu Shen</a>,
+      <a href="https://www.peterhenderson.co/">Peter Henderson</a>
+    </p>
+    <p class="affils">Princeton University</p>
+    <div class="links">
+      <a href="https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf">PDF</a>
+      <a href="https://github.com/zeyushen-yo/rl_moe/tree/main">Code</a>
+      <a href="#">Checkpoint (coming soon)</a>
+      <a href="#results">Results</a>
+    </div>
+  </div>
+
+  <div class="col-wide headline-fig">
+    <img src="static/figures/headline.png?v=2" alt="Standard MoE switches experts every token; our temporally extended controller learns to keep the same expert set for many tokens at a time, enabling memory-efficient serving, temporal chunking for training, and expandable continual learning.">
+    <p class="caption">
+      <strong>Standard MoEs</strong> change their active expert set at almost every token. Our <strong>option controller</strong> learns when to keep the current set and when to switch, governed by a deliberation cost &eta;. The result: switch rates collapse from over 50% to below 5%, while accuracy stays close to the base model &mdash; opening the door to memory-efficient serving, temporal chunking for training, and continual expansion of the expert pool.
+    </p>
+  </div>
+</div>
+
+<!-- Overview -->
+<section id="overview">
+  <div class="col">
+    <h2>TL;DR</h2>
+    <ul class="takeaways">
+      <li><strong>Three frontier open-source MoEs (gpt-oss-20b/120b, Qwen3-Next-80B) all switch experts at &gt; 0.94 of token positions.</strong> Routing has no temporal structure, so any memory optimization that depends on expert reuse is left on the table.</li>
+      <li><strong>The problem maps cleanly onto the options framework.</strong> Each layer's expert mask is an option; choosing when to terminate it is exactly the situation that <em>options with deliberation costs</em> (Sutton et al., 1999; Harb et al., 2018) were designed for.</li>
+      <li><strong>A small per-layer option controller, trained on top of frozen <code>gpt-oss-20b</code> with LoRA and a self-distillation reward, learns the trade-off.</strong> No new pretraining needed.</li>
+      <li><strong>Switch rate drops from &gt;50% to as low as 0.7%</strong>, while keeping up to <strong>~90% of base model accuracy</strong> on MATH, MMLU, and MMMLU. The trade-off is dialed by a single hyperparameter, the deliberation cost &eta;.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- The problem -->
+<section id="problem">
+  <div class="col">
+    <h2>The Problem: MoE Routing Has No Temporal Structure</h2>
+    <p>
+      Mixture-of-Experts (MoE) layers are everywhere in modern LLMs &mdash; <code>Gemini-2.5-Pro</code>, <code>DeepSeek-V3</code>, <code>Qwen3-Next-80B</code>, <code>gpt-oss</code>, and many more. Only a sparse subset of experts is active per token, so a 120B-parameter model like <code>gpt-oss-120b</code> only activates ~5B parameters at a time. In principle, you can keep growing the expert pool while inference compute stays flat.
+    </p>
+    <p>
+      But once the experts no longer fit on GPU, weights have to live on host memory or disk and be loaded on demand. Every load is latency. Current MoE routers <strong>don't account for this cost at all</strong>: the active expert set changes at almost every token. We measured this directly across three frontier open-source MoEs, on 1,000 prompts spanning chat, code, math, STEM, and 6 multilingual categories &mdash; the switch rate is essentially 1.
+    </p>
+
+    <div class="fig-row three">
+      <div>
+        <img src="static/figures/expert_activation_gpt_oss_20b_math_layer0.png" alt="Active experts vs. token position, gpt-oss-20b layer 0" loading="lazy">
+        <div class="caption">gpt-oss-20b &mdash; layer 0</div>
+      </div>
+      <div>
+        <img src="static/figures/expert_activation_gpt_oss_120b_math_layer0.png" alt="Active experts vs. token position, gpt-oss-120b layer 0" loading="lazy">
+        <div class="caption">gpt-oss-120b &mdash; layer 0</div>
+      </div>
+      <div>
+        <img src="static/figures/expert_activation_qwen3_80b_math_layer0.png" alt="Active experts vs. token position, Qwen3-Next-80B layer 0" loading="lazy">
+        <div class="caption">Qwen3-Next-80B-A3B &mdash; layer 0</div>
+      </div>
+    </div>
+    <p class="muted small" style="text-align:center; margin-top:-.5rem;">
+      Active experts (rows) over generated token positions (columns) on the same prompt. There is essentially no temporal structure: nearly every column is a fresh draw.
+    </p>
+
+    <details>
+      <summary>See the per-category switch rate table</summary>
+      <div class="inner">
+        <p>Average switch rate across 100 prompts per category (with $\maskk = \activek$, i.e., the model's native top-$\activek$). Mean &plusmn; std.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Model</th><th>Chat</th><th>Code</th><th>Math</th><th>STEM</th><th>Multi (en)</th><th>Multi (de)</th><th>Multi (es)</th><th>Multi (fr)</th><th>Multi (it)</th><th>Multi (ja)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>gpt-oss-20b</td><td>0.94</td><td>0.95</td><td>0.94</td><td>0.95</td><td>0.95</td><td>0.95</td><td>0.95</td><td>0.95</td><td>0.95</td><td>0.95</td></tr>
+              <tr><td>gpt-oss-120b</td><td>0.98</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td><td>0.99</td></tr>
+              <tr><td>Qwen3-Next-80B</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td><td>1.00</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <h3>Why this matters: missed opportunities</h3>
+    <p>If the active expert set <em>were</em> temporally extended, several memory-related optimizations become natural:</p>
+    <ul class="takeaways">
+      <li><strong>Inference serving with reduced memory.</strong> Only the $\maskk$ active experts need to be GPU-resident; the other $N - \maskk$ can stay on host or disk. For <code>gpt-oss-20b</code>, keeping 16 of 32 experts saves ~4.7 GiB (37%); keeping 8 saves ~7.1 GiB (55%) of VRAM.</li>
+      <li><strong>Memory-efficient training via temporal chunking.</strong> Each contiguous chunk of tokens can be associated with a fixed expert mask, so only those experts participate in the forward and backward pass. Inactive experts can be offloaded for the chunk.</li>
+      <li><strong>Continual learning with expandable expert capacity.</strong> Because only $\maskk$ of $N$ experts are active at a time, you can keep <em>adding</em> experts (e.g., to adapt to new domains) without growing the per-token compute or active memory footprint.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- The Idea -->
+<section id="idea">
+  <div class="col">
+    <h2>The Idea: MoE Routing as Options With Deliberation Costs</h2>
+    <p>
+      Choosing when to commit to a set of resources and when to pay the cost of switching is exactly the structure formalized by <strong>temporally extended actions</strong> in the options framework (Sutton, Precup, Singh, 1999). An agent picks a high-level "option" that persists over many time steps; switching to a new option incurs a <strong>deliberation cost</strong> (Harb et al., 2018).
+    </p>
+    <p>
+      We propose <strong>temporally extended Mixture-of-Experts</strong>: a small per-layer controller that learns when to switch the expert set and which one to switch to, optimized via the option-critic architecture (Bacon et al., 2017) augmented with a deliberation cost &eta;. Because the switching cost is an explicit term in the objective, the controller automatically discovers temporal structure &mdash; it only switches when the expected quality gain justifies the cost.
+    </p>
+
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-num">Cast as</div>
+        <div class="step-title">s-MDP with options</div>
+        <div class="step-desc">Each layer's expert mask is an option $\omega^{(\ell)}_t$; expert loading latency is the deliberation cost.</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step highlight">
+        <div class="step-num">Add</div>
+        <div class="step-title">Lightweight per-layer controller</div>
+        <div class="step-desc">Termination head, value &amp; option-value heads, and a Plackett&ndash;Luce selection head. Initialized from the router; trained with option-critic + deliberation cost.</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-num">Train via</div>
+        <div class="step-title">Self-distillation</div>
+        <div class="step-desc">Reward is per-token reverse KL between the (frozen) base model and the controller-augmented student. LoRA on experts &amp; attention, full grads on router.</div>
+      </div>
+    </div>
+
+    <p class="muted small">
+      The intra-option policy is the LLM itself; primitive actions are generated tokens. Critic and termination updates follow A2OC (Harb et al., 2018) with GAE($\lambda$); intra-option policy gradients use Monte Carlo returns.
+    </p>
+  </div>
+</section>
+
+<!-- Method -->
+<section id="method">
+  <div class="col">
+    <h2>How It Works</h2>
+
+    <h3>Options formulation</h3>
+    <p>
+      For each MoE layer $\ell$, the option space is the set of binary expert masks of size $\maskk$:
+    </p>
+    <div class="eq-box">$$\Omega^{(\ell)} = \big\{\omega \in \{0,1\}^N : \|\omega\|_1 = \maskk\big\}.$$</div>
+    <p>
+      The router is constrained to pick its top-$\activek$ experts only from the active mask $\omega^{(\ell)}_t$. The mask persists across tokens until a termination decision $d^{(\ell)}_t = 1$ triggers selection of a new mask. We factorize across layers for tractability: each layer has its own controller conditioning on its hidden state and current mask.
+    </p>
+
+    <h3>Controller architecture</h3>
+    <p>
+      Each MoE layer gets its own controller, operating on the pre-MLP hidden state $h^{(\ell)}_t$ and the current mask $\omega^{(\ell)}_{t-1}$. It has four heads:
+    </p>
+    <ul class="takeaways">
+      <li><strong>Expert-set embedding.</strong> A DeepSets encoder $z^{(\ell)}(\omega) = \tfrac{1}{\maskk}\sum_{i \in \omega} \varphi(e_i)$ over learned per-expert embeddings produces a permutation-invariant representation of any mask.</li>
+      <li><strong>Termination head.</strong> $\beta^{(\ell)}_t = \sigma\big(\mathrm{MLP}_\beta\big(\overline h^{(\ell)}_t,\, \overline z^{(\ell)}(\omega^{(\ell)}_{t-1})\big)\big)$, with RMSNorm on both inputs.</li>
+      <li><strong>Value &amp; option-value heads.</strong> $V_\Omega(h)$ is a linear head; $Q_\Omega(h, \omega)$ is a 2-layer MLP over the (hidden, mask-embedding) pair.</li>
+      <li><strong>Option selection head.</strong> A linear layer $f_\text{sel}$ initialized from the router weights produces candidate logits; we sample $\maskk$ experts via the <strong>Plackett&ndash;Luce</strong> distribution (vectorized via the Gumbel-top-$\maskk$ trick).</li>
+    </ul>
+    <div class="eq-box">$$P_{\mathrm{PL}}(i_1, \ldots, i_{\maskk} \mid c) = \prod_{j=1}^{\maskk} \frac{\exp(c_{i_j})}{\sum_{m \notin \{i_1, \ldots, i_{j-1}\}} \exp(c_m)}.$$</div>
+
+    <h3>Reward: per-token reverse KL self-distillation</h3>
+    <p>
+      Following on-policy distillation (Gu et al., 2024), we use the per-token reverse KL between the frozen base ("teacher") model and the controller-augmented "student" as the per-token reward:
+    </p>
+    <div class="eq-box">$$r_t = \log p_{\mathrm{teacher}}(a_t \mid x, a_{&lt;t}) - \log p_{\mathrm{student}}(a_t \mid x, a_{&lt;t}).$$</div>
+    <p>
+      In expectation over the student, $-r_t$ is an unbiased estimator of $\mathrm{KL}(p_\text{student}\,\|\,p_\text{teacher})$. To avoid reward hacking via degenerate outputs, we sample tokens from a mixture $p_\mathrm{mix} = (1-\tau)p_\text{student} + \tau p_\text{teacher}$ with $\tau = 0.2$ and apply approximate importance weights, following MiniLLM (Gu et al., 2024).
+    </p>
+
+    <h3>Updates</h3>
+    <p>
+      Critics are trained against GAE($\lambda$) targets. Termination gradient adds the deliberation cost $\eta$ as a margin (so the option only terminates when $Q_\Omega(s, \omega) - V_\Omega(s) + \eta &lt; 0$):
+    </p>
+    <div class="eq-box">$$-\sum_{s,\omega} \mu(s,\omega) \frac{\partial \beta_\omega(s)}{\partial \nu} \big(Q_\Omega(s, \omega) - V_\Omega(s) + \eta\big).$$</div>
+    <p>
+      Selection gradients are accumulated only at switch positions, using $Q_\Omega - V_\Omega$ as the advantage. Intra-option policy gradients update LoRA adapters on experts and attention (rank 16) and the router weights, using Monte Carlo returns of $r_t$.
+    </p>
+
+    <details>
+      <summary>See the full algorithm pseudocode</summary>
+      <div class="inner">
+<pre style="font-size:.78rem; line-height:1.5; white-space:pre-wrap; background:#f7f7f7; padding:1rem; border-radius:4px; color:#333;">For each training iteration:
+  Sample prompt x from D
+  ─ Rollout with teacher mixing ─
+  Initialise ω_0^(ℓ) ← TopK(g_0^(ℓ), k_mask)         # from router logits
+  For t = 1 ... T:
+    For each layer ℓ:
+      β_t^(ℓ) ← termination(h_t^(ℓ), ω_{t-1}^(ℓ))
+      d_t^(ℓ) ~ Bernoulli(β_t^(ℓ))
+      if d_t^(ℓ) = 1: ω_t^(ℓ) ~ Plackett-Luce(c_t^(ℓ), k_mask)
+      else:           ω_t^(ℓ) ← ω_{t-1}^(ℓ)
+      mask router logits to experts in ω_t^(ℓ)
+    a_t ~ p_mix = (1-τ)·π_student + τ·p_teacher
+    w_t  ← π_student(a_t) / p_mix(a_t)
+    r_t  ← log p_teacher(a_t) − log π_student(a_t)
+  ─ Controller updates ─
+  For each layer ℓ:
+    Compute GAE(λ) targets V̂_t, Q̂_t
+    For t = 1 ... T:
+      dν -= w_t · ∇_ν β_t^(ℓ) · (Q_Ω - V_Ω + η)
+      if d_t^(ℓ) = 1:
+        dφ += w_t · ∇_φ log π_sel(ω_t^(ℓ)) · (Q_Ω - V_Ω)
+      dψ -= ∇_ψ [(V_Ω - V̂_t)² + (Q_Ω - Q̂_t)²]
+  ─ Intra-option policy update ─
+  For t = 1 ... T:
+    Ḡ_t = Σ_{j≥0} γ^j r_{t+j}
+    dθ += w_t · ∇_θ log π_student(a_t) · Ḡ_t
+  Apply (ν, ψ, φ) ← (·) + α_ctrl/L · (dν, dψ, dφ)
+  Apply θ ← θ + α_intra · dθ
+</pre>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- Results -->
+<section id="results">
+  <div class="col">
+    <h2>Results</h2>
+
+    <p>
+      We train one controller per setting on top of <code>gpt-oss-20b</code> (24 layers, 32 experts/layer, top-4 routing) on the Nemotron Post-Training Dataset v2, with 4 &times; H200 GPUs and a modified TRL. We sweep deliberation cost $\eta \in \{0.02, 0.03, 0.04\}$ and mask size $\maskk \in \{8, 16\}$. We compare against four pruning baselines (Frequency, Reconstruction, Random, Wanda-structured) calibrated on 128 generated responses.
+    </p>
+
+    <div class="results-grid">
+      <div class="result-num">
+        <div class="big">&gt;50% &rarr; &lt;5%</div>
+        <div class="desc">Switch rate reduction across MATH, MMLU, MMMLU</div>
+      </div>
+      <div class="result-num">
+        <div class="big">~90%</div>
+        <div class="desc">of base-model accuracy retained at $\maskk = 16$, $\eta = 0.02$</div>
+      </div>
+      <div class="result-num">
+        <div class="big">+12 pp</div>
+        <div class="desc">average accuracy lift over the best pruning baseline at $\maskk = 16$</div>
+      </div>
+    </div>
+
+    <h3>Main result: $\maskk = 16$ (half the experts kept active)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th rowspan="2">Benchmark</th>
+            <th rowspan="2">Base Model</th>
+            <th colspan="4">Pruning Baselines</th>
+            <th colspan="3">Ours (Learned Controller)</th>
+          </tr>
+          <tr>
+            <th>Frequency</th><th>Reconstruction</th><th>Random</th><th>Wanda</th>
+            <th>&eta; = 0.02</th><th>&eta; = 0.03</th><th>&eta; = 0.04</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>MATH</td>
+            <td class="base">71.5</td>
+            <td>53.5</td><td>51.5</td><td>15.0</td><td>3.5</td>
+            <td class="better">64.0</td><td>58.5</td><td>55.0</td>
+          </tr>
+          <tr class="switch-row">
+            <td class="switch">switch %</td>
+            <td class="switch">58.6</td>
+            <td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td>
+            <td class="switch">4.1</td><td class="switch">1.3</td><td class="switch">0.7</td>
+          </tr>
+          <tr>
+            <td>MMLU</td>
+            <td class="base">79.5</td>
+            <td>55.5</td><td>35.0</td><td>33.5</td><td>9.0</td>
+            <td class="better">72.5</td><td>67.5</td><td>63.0</td>
+          </tr>
+          <tr class="switch-row">
+            <td class="switch">switch %</td>
+            <td class="switch">57.1</td>
+            <td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td>
+            <td class="switch">4.2</td><td class="switch">1.3</td><td class="switch">0.8</td>
+          </tr>
+          <tr>
+            <td>MMMLU</td>
+            <td class="base">67.5</td>
+            <td>42.0</td><td>48.0</td><td>24.0</td><td>7.0</td>
+            <td class="better">59.5</td><td>56.5</td><td>49.5</td>
+          </tr>
+          <tr class="switch-row">
+            <td class="switch">switch %</td>
+            <td class="switch">54.5</td>
+            <td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td>
+            <td class="switch">4.2</td><td class="switch">1.4</td><td class="switch">0.8</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="muted small">
+      Accuracy and switch rate (%, mean &plusmn; 95% CI) on 200 randomly selected questions from each benchmark. Bold = best non-base-model column. The controller (eta = 0.02) keeps switch rates around 4% while losing only a few points relative to the base model, dramatically outperforming all pruning baselines.
+    </p>
+
+    <details>
+      <summary>See the more aggressive setting: $\maskk = 8$ (only 25% of experts kept active)</summary>
+      <div class="inner">
+        <p>The trade-off becomes steeper, but our controller still substantially outperforms all baselines and pushes switch rates as low as 5%.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th rowspan="2">Benchmark</th>
+                <th rowspan="2">Base</th>
+                <th colspan="4">Pruning Baselines</th>
+                <th colspan="3">Ours</th>
+              </tr>
+              <tr>
+                <th>Freq</th><th>Recon</th><th>Random</th><th>Wanda</th>
+                <th>&eta; = 0.02</th><th>&eta; = 0.03</th><th>&eta; = 0.04</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>MATH</td><td class="base">71.5</td><td>11.5</td><td>7.5</td><td>0.0</td><td>0.0</td><td class="better">27.5</td><td>23.0</td><td>15.5</td></tr>
+              <tr class="switch-row"><td class="switch">switch %</td><td class="switch">79.0</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">9.2</td><td class="switch">7.4</td><td class="switch">5.4</td></tr>
+              <tr><td>MMLU</td><td class="base">79.5</td><td>12.5</td><td>2.5</td><td>4.0</td><td>0.0</td><td class="better">48.5</td><td>41.0</td><td>38.0</td></tr>
+              <tr class="switch-row"><td class="switch">switch %</td><td class="switch">77.4</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">8.5</td><td class="switch">7.6</td><td class="switch">5.0</td></tr>
+              <tr><td>MMMLU</td><td class="base">67.5</td><td>8.5</td><td>1.0</td><td>3.0</td><td>0.0</td><td class="better">39.0</td><td>31.5</td><td>22.5</td></tr>
+              <tr class="switch-row"><td class="switch">switch %</td><td class="switch">75.5</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">&mdash;</td><td class="switch">9.0</td><td class="switch">8.0</td><td class="switch">5.4</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted small">Wanda's structured pruning collapses to 0% on MATH/MMLU at this rate &mdash; the model effectively breaks. Random and reconstruction-based pruning also fall apart. Our controller still gets 27&ndash;48% on the three benchmarks with switch rates of 5&ndash;9%.</p>
+      </div>
+    </details>
+
+    <h3>Training dynamics</h3>
+    <p>
+      Reward (negative reverse KL per token) climbs steadily, while switch rate first drops sharply (as the value networks learn) and then settles to a level governed by &eta;. Larger &eta; converges to a lower switch rate, as expected.
+    </p>
+    <div class="fig-row-inner" style="max-width:760px;">
+      <img src="static/figures/exp8_training_curves.png" alt="Reward and switch-rate curves for k=8" loading="lazy">
+      <div class="caption">Training curves at $\maskk = 8$ for the three deliberation costs. Reward improves throughout training; switch rate U-shapes then stabilizes at a level set by &eta;. Bands are bootstrap 95% CIs over a 20-step running window.</div>
+    </div>
+
+    <details>
+      <summary>See additional curves: switch probability and losses</summary>
+      <div class="inner">
+        <div class="fig-row two">
+          <div>
+            <img src="static/figures/exp8_switch_prob.png" alt="Switch probability over training, k=8" loading="lazy">
+            <div class="caption">Switch probability over training, $\maskk = 8$.</div>
+          </div>
+          <div>
+            <img src="static/figures/exp16_switch_prob.png" alt="Switch probability over training, k=16" loading="lazy">
+            <div class="caption">Switch probability over training, $\maskk = 16$.</div>
+          </div>
+        </div>
+        <div class="fig-row two">
+          <div>
+            <img src="static/figures/exp8_losses.png" alt="Losses, k=8" loading="lazy">
+            <div class="caption">Losses, $\maskk = 8$.</div>
+          </div>
+          <div>
+            <img src="static/figures/exp16_losses.png" alt="Losses, k=16" loading="lazy">
+            <div class="caption">Losses, $\maskk = 16$.</div>
+          </div>
+        </div>
+        <div class="fig-row-inner" style="max-width:520px;">
+          <img src="static/figures/exp8_rep_ppl.png" alt="Repetition and perplexity, k=8" loading="lazy">
+          <div class="caption">Repetition and perplexity, $\maskk = 8$.</div>
+        </div>
+      </div>
+    </details>
+
+    <h3>Temporal continuity, before and after</h3>
+    <p>
+      The clearest qualitative result: under our controller, expert masks <strong>persist for many tokens at a time</strong>. Each row is an expert; each column is a generated token. The base model (left) is essentially noise; the trained controller (right) shows long flat runs.
+    </p>
+
+    <div class="compare">
+      <div class="panel before">
+        <h4>Base gpt-oss-20b (layer 0)</h4>
+        <img src="static/figures/expert_activation_gpt_oss_20b_math_layer0.png" alt="Base model expert activations">
+        <p class="muted small" style="margin-top:.5rem;">
+          Switches at <strong>~94%</strong> of token positions. Mask reuse: essentially none.
+        </p>
+      </div>
+      <div class="panel after">
+        <h4>Ours, $\maskk = 8$, $\eta = 0.02$ (layer 0)</h4>
+        <img src="static/figures/expert_activation_ctrl_k8_eta0.02_layer0.png" alt="Controlled expert activations">
+        <p class="muted small" style="margin-top:.5rem;">
+          Same prompt, same model. Switches at <strong>~9%</strong> of positions: the active expert set persists for ~100 tokens at a time.
+        </p>
+      </div>
+    </div>
+
+    <details>
+      <summary>See more layers and configurations</summary>
+      <div class="inner">
+        <p><strong>$\maskk = 8$, $\eta = 0.02$</strong></p>
+        <div class="fig-row three">
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.02_layer0.png" alt="k=8 eta=0.02 layer 0"><div class="caption">Layer 0</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.02_layer1.png" alt="k=8 eta=0.02 layer 1"><div class="caption">Layer 1</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.02_layer2.png" alt="k=8 eta=0.02 layer 2"><div class="caption">Layer 2</div></div>
+        </div>
+        <p><strong>$\maskk = 8$, $\eta = 0.03$</strong></p>
+        <div class="fig-row three">
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.03_layer0.png" alt="k=8 eta=0.03 layer 0"><div class="caption">Layer 0</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.03_layer1.png" alt="k=8 eta=0.03 layer 1"><div class="caption">Layer 1</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k8_eta0.03_layer2.png" alt="k=8 eta=0.03 layer 2"><div class="caption">Layer 2</div></div>
+        </div>
+        <p><strong>$\maskk = 16$, $\eta = 0.03$</strong></p>
+        <div class="fig-row three">
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.03_layer0.png" alt="k=16 eta=0.03 layer 0"><div class="caption">Layer 0</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.03_layer1.png" alt="k=16 eta=0.03 layer 1"><div class="caption">Layer 1</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.03_layer2.png" alt="k=16 eta=0.03 layer 2"><div class="caption">Layer 2</div></div>
+        </div>
+        <p><strong>$\maskk = 16$, $\eta = 0.04$</strong></p>
+        <div class="fig-row three">
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.04_layer0.png" alt="k=16 eta=0.04 layer 0"><div class="caption">Layer 0</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.04_layer1.png" alt="k=16 eta=0.04 layer 1"><div class="caption">Layer 1</div></div>
+          <div><img src="static/figures/expert_activation_ctrl_k16_eta0.04_layer2.png" alt="k=16 eta=0.04 layer 2"><div class="caption">Layer 2</div></div>
+        </div>
+        <p class="muted small">Different layers can have different temporal continuity, but qualitatively all of them switch rarely under the trained controller.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- Why it matters -->
+<section>
+  <div class="col">
+    <h2>Why This Matters</h2>
+    <p>
+      We see this as evidence that <strong>even pretrained MoEs can be cheaply converted</strong> into temporally extended ones &mdash; no large-scale retraining required. As expert counts continue to grow (potentially scaling with available <em>disk</em> rather than GPU memory), the cost of switching will increasingly dominate serving latency. Treating expert loading as a temporally extended decision, with an explicit deliberation cost, may offer a principled handle on this trade-off.
+    </p>
+    <p>
+      Our framework is compatible with existing caching/prefetching systems like <a href="https://arxiv.org/abs/2401.14361">MoE-Infinity</a>: those approaches optimize <em>how</em> to move experts; ours reduces <em>how often</em> they need to move at all.
+    </p>
+    <p>
+      We view this work as a first step. Promising directions: making temporal extension a first-class objective in MoE pre-training, scaling to much larger expert pools (where GPU residency is fundamentally infeasible), and using the controller's mask continuity as a primitive for continual learning with growing expert sets.
+    </p>
+  </div>
+</section>
+
+<!-- Citation -->
+<section>
+  <div class="col">
+    <h2>Citation</h2>
+    <pre class="bib">@article{shen2026temoe,
+  title  = {Temporally Extended Mixture-of-Experts Models},
+  author = {Shen, Zeyu and Henderson, Peter},
+  year   = {2026}
+}</pre>
+  </div>
+</section>
+
+<footer>
+  &copy; 2026 Zeyu Shen, Peter Henderson. Princeton University.
+</footer>
+
+<script>
+  // Provide LaTeX macros used in the math we render with KaTeX
+  // (so tokens like \maskk and \activek render as a styled k_mask / k_act).
+  document.addEventListener('DOMContentLoaded', function () {
+    if (typeof renderMathInElement !== 'function') return;
+    renderMathInElement(document.body, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '$',  right: '$',  display: false }
+      ],
+      macros: {
+        '\\maskk':   'k_{\\mathrm{mask}}',
+        '\\activek': 'k_{\\mathrm{act}}'
+      }
+    });
+  });
+</script>
+
+</body>
+</html>

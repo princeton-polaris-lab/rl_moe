@@ -4,7 +4,7 @@ This repository implements **temporally extended MoE** controller training using
 
 **Paper:** [Temporally Extended Mixture-of-Experts Models](https://github.com/zeyushen-yo/rl_moe/blob/main/Temporally_extended_MoE_models___arxiv.pdf)
 
-**Project Page:** [https://princeton-polaris-lab.github.io/temoe/](https://princeton-polaris-lab.github.io/temoe/)
+**Project Page:** [https://princeton-polaris-lab.github.io/moe_webpage/](https://princeton-polaris-lab.github.io/moe_webpage/)
 
 ## Features
 

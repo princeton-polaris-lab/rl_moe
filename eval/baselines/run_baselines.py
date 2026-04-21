@@ -11,7 +11,6 @@ Methods implemented:
 - reconstruction: Greedy addition minimizing reconstruction loss
 - wanda: Canonical weight pruning (unstructured 50% or 2:4 structured)
 - random: Random expert selection
-- eep: Evolutionary search using accuracy as fitness (math mode only)
 """
 
 import os
@@ -34,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data_utils import get_calibration_data, load_math_problems
 from frequency_pruning import run_frequency_pruning
 from reconstruction_pruning import run_reconstruction_pruning
-from eep_pruning import run_eep_pruning
 from wanda_pruning import run_wanda_pruning
 
 # Import evaluation utilities from parent
@@ -210,7 +208,7 @@ def main():
     parser.add_argument("--mode", type=str, choices=["general", "math", "nemotron"], default="math",
                         help="Calibration mode: 'general' (C4), 'math' (MATH rollouts), or 'nemotron' (Nemotron rollouts)")
     parser.add_argument("--method", type=str, 
-                        choices=["frequency", "reconstruction", "wanda", "eep", "random", "all"],
+                        choices=["frequency", "reconstruction", "wanda", "random", "all"],
                         default="all",
                         help="Which method to run")
     
@@ -225,12 +223,6 @@ def main():
                         help="Number of experts to keep per layer")
     parser.add_argument("--top-k", type=int, default=8,
                         help="Top-k experts activated per token")
-    
-    # EEP parameters
-    parser.add_argument("--eep-iterations", type=int, default=200,
-                        help="Total EEP iterations (split 40/160 pruning/merging)")
-    parser.add_argument("--eep-population", type=int, default=30,
-                        help="EEP population size")
     
     # Wanda parameters
     parser.add_argument("--wanda-sparsity-type", type=str, default="unstructured",
@@ -313,17 +305,9 @@ def main():
     
     # Determine which methods to run
     if args.method == "all":
-        if args.mode == "general":
-            methods = ["frequency", "reconstruction", "wanda", "random"]  # No EEP for general mode
-        else:
-            methods = ["frequency", "reconstruction", "wanda", "eep", "random"]
+        methods = ["frequency", "reconstruction", "wanda", "random"]
     else:
         methods = [args.method]
-    
-    # Check if EEP is valid for mode
-    if "eep" in methods and args.mode == "general":
-        print("Warning: EEP requires 'math' mode (needs accuracy evaluation)")
-        methods.remove("eep")
     
     # Get calibration data
     if args.load_selections is None:
@@ -391,37 +375,6 @@ def main():
         
         # Note: Wanda is weight pruning, not expert selection
         # We handle it separately after this block
-        
-        if "eep" in methods:
-            if problems is None:
-                print("ERROR: EEP requires problems with answers (math mode)")
-            else:
-                print(f"\n{'='*70}")
-                print("Running EEP expert selection")
-                print(f"{'='*70}")
-                
-                eep_selections = run_eep_pruning(
-                    model=model,
-                    tokenizer=tokenizer,
-                    problems=problems,
-                    num_experts_to_keep=args.num_experts,
-                    total_iterations=args.eep_iterations,
-                    population_size=args.eep_population,
-                )
-                expert_selections["eep"] = eep_selections
-                
-                save_expert_selections(
-                    eep_selections,
-                    os.path.join(args.output_dir, f"eep_{args.mode}_k{args.num_experts}_experts.json"),
-                    method="eep",
-                    mode=args.mode,
-                    metadata={
-                        "num_calibration": args.num_calibration,
-                        "iterations": args.eep_iterations,
-                        "population": args.eep_population,
-                        "num_experts": args.num_experts,
-                    },
-                )
         
         if "random" in methods:
             print(f"\n{'='*70}")

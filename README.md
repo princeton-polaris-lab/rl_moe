@@ -126,9 +126,13 @@ rl_moe/
 ## Citation
 
 ```bibtex
-@article{shen2026temoe,
-  title  = {Temporally Extended Mixture-of-Experts Models},
-  author = {Shen, Zeyu and Henderson, Peter},
-  year   = {2026}
+@misc{shen2026temporallyextendedmixtureofexpertsmodels,
+      title={Temporally Extended Mixture-of-Experts Models},
+      author={Zeyu Shen and Peter Henderson},
+      year={2026},
+      eprint={2604.20156},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2604.20156},
 }
 ```
